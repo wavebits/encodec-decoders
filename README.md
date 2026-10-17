@@ -67,16 +67,34 @@ With [Zig](https://ziglang.org) 0.17, which builds both versions (the default op
 mode is `fast`):
 
 ```bash
-zig build                                    # native
+zig build                                    # native, best backend for the target
 zig build -Dstrip=true                       # drop debug info (smallest binaries)
+zig build -Dbackend=neon                     # pick the C compute backend (see below)
 zig build -Dtarget=aarch64-linux-musl        # cross-compile, e.g. for an ARM64 Linux board
+zig build -Dprofile=true                     # print time per decoder stage when done
 ```
 
-For the C version on its own, any C17 compiler works:
+### C compute backends
+
+All the heavy layers are matrix products, which go through one small interface
+(`c/backend.h`). One backend is compiled in:
+
+| Backend | Platforms | What it uses | Extra dependency |
+| --- | --- | --- | --- |
+| `ref` | everywhere | plain C loops the compiler vectorizes | none |
+| `neon` | any AArch64: Apple silicon, Android phones, Raspberry Pi | hand-written NEON kernels (8×12 register blocking) | none |
+| `accelerate` | macOS, iOS | Apple's BLAS, which uses the CPU's matrix units | Accelerate (part of the OS) |
+
+`-Dbackend=auto`, the default, picks `accelerate` on Apple platforms, `neon` on other
+AArch64 targets and `ref` elsewhere. The CLI prints the backend it was built with.
+
+For the C version on its own, any C17 compiler works. Add the backend's define:
 
 ```bash
-cc -std=c17 -O3 c/*.c -lm -lpthread -framework AudioToolbox -o wb_decode-c   # macOS
-cc -std=c17 -O3 c/*.c -lm -lpthread -o wb_decode-c                           # Linux
+cc -std=c17 -O3 c/*.c -lm -lpthread -framework AudioToolbox -o wb_decode-c                    # ref, macOS
+cc -std=c17 -O3 -DZENCODEC_BACKEND_NEON c/*.c -lm -lpthread -o wb_decode-c                     # neon, Linux
+cc -std=c17 -O3 -DZENCODEC_BACKEND_ACCELERATE -DACCELERATE_NEW_LAPACK c/*.c -lm -lpthread \
+   -framework AudioToolbox -framework Accelerate -o wb_decode-c                                 # accelerate, macOS
 ```
 
 Stripped sizes:
@@ -90,8 +108,10 @@ Stripped sizes:
 
 ### Embedding on phones and devices
 
-To embed the decoder, add the two files `c/zencodec.{h,c}` to your project. They need
-only libc, libm and pthreads. Leave out `c/play.c` and `c/main.c`, which are the CLI.
+To embed the decoder, add `c/zencodec.{h,c}`, `c/backend.h`, `c/backend_ref.c` and the
+backend file you want (`backend_neon.c` or `backend_accelerate.c`) to your project, and
+define its `ZENCODEC_BACKEND_*` macro. They need only libc, libm and pthreads (plus
+Accelerate for that backend). Leave out `c/play.c` and `c/main.c`, which are the CLI.
 
 - **iOS / macOS:** add the files to an Xcode target. They can be called from Swift through
   a bridging header.
@@ -109,7 +129,10 @@ For budgeting:
   of the audio.
 - **Weights:** 23 MB in f16. Generate them with `scripts/convert.py`, bundle them as an app
   asset, and load them with `zencodec_load`. Check that the license terms below fit your app.
-- **CPU:** the number of threads is a parameter; 2–4 suits big cores on a phone.
+- **CPU:** the number of threads is a parameter; use the number of performance cores
+  (2–4 on most phones). On Apple platforms, worker threads run at the calling thread's
+  QoS class, so call the decoder from a thread with `QOS_CLASS_USER_INITIATED` or higher
+  to stay on the performance cores.
 
 ## Usage
 
@@ -202,17 +225,26 @@ the f32 weights, every second stays at about 80 dB.
 To reproduce:
 
 ```bash
-bench/compare_encodec_cpp.sh input.ecdc [n_threads] [n_runs]
+python bench/bench.py in.ecdc [more.ecdc ...] -t 1,4 -r 3 [--baseline <git rev>]
 ```
 
-The script:
+`bench/bench.py`:
 
-1. Clones encodec.cpp at a pinned commit into `bench/work/` and applies
-   `bench/encodec_cpp.patch` (see below).
-2. Builds both projects.
-3. Decodes the file with each decoder in turn, including PyTorch via
-   `bench/python_decode.py` if `encodec` and `torch` are installed.
-4. Prints wall time, CPU time, peak memory and binary size.
+1. Builds `wb_decode-c` once per C backend, plus `wb_decode-zig`. With `--baseline`, it
+   also builds `wb_decode-c` from an earlier commit, for before/after comparisons.
+2. Clones encodec.cpp at a pinned commit into `bench/work/`, applies
+   `bench/encodec_cpp.patch` (see below) and builds it.
+3. Uses the PyTorch `encodec` package through `bench/python_decode.py`, if `encodec` and
+   `torch` are installed.
+4. Runs every decoder on every input and thread count, interleaved, and records:
+   - wall time, and the decode time each decoder reports itself
+   - CPU time (user and sys)
+   - peak memory
+   - binary or install size
+   - SNR against the PyTorch decoder, overall and for the worst second
+5. Prints a Markdown table, and writes it with a description of the machine to
+   `bench/results/<date>_<commit>.md`. It also appends one row per measurement to
+   `bench/results/history.csv`, so results can be tracked across commits and machines.
 
 Setup for all results below (2026-10-17, Apple M1, 16 GB):
 
@@ -359,7 +391,8 @@ file, pass `--out`. The f32 file matches PyTorch to within 16-bit WAV rounding.
 
 | Path | Purpose |
 | --- | --- |
-| `c/zencodec.{h,c}` | C17 decoder library: the two files to embed |
+| `c/zencodec.{h,c}` | C17 decoder library |
+| `c/backend*.{h,c}` | C compute backends: `ref`, `neon`, `accelerate` |
 | `c/play.{h,c}`, `c/main.c` | C command-line tool and playback |
 | `zig/src/zencodec.zig` | Zig decoder (`@Vector` SIMD, `std.Thread`) |
 | `zig/src/play.zig`, `zig/src/main.zig` | Zig command-line tool and playback |

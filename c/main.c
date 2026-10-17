@@ -23,6 +23,10 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <pthread/qos.h>
+#include <sys/sysctl.h>
+#endif
 
 static double now_ms(void) {
     struct timespec ts;
@@ -194,9 +198,24 @@ static int usage(const char * argv0) {
     return 1;
 }
 
+// Default thread count: the performance cores on Apple silicon (efficiency cores
+// only slow the other threads down), otherwise all online CPUs.
+static int default_threads(void) {
+#ifdef __APPLE__
+    int n = 0;
+    size_t len = sizeof(n);
+    if (sysctlbyname("hw.perflevel0.physicalcpu", &n, &len, NULL, 0) == 0 && n > 0) return n;
+#endif
+    const long n_cpu = sysconf(_SC_NPROCESSORS_ONLN);
+    return n_cpu > 0 ? (int) n_cpu : 1;
+}
+
 int main(int argc, char ** argv) {
-    long n_cpu = sysconf(_SC_NPROCESSORS_ONLN);
-    int n_threads = n_cpu > 0 ? (int) n_cpu : 1;
+#ifdef __APPLE__
+    // ask for performance cores; worker threads inherit this class
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+#endif
+    int n_threads = default_threads();
     const char * pos[4];
     int n_pos = 0;
     for (int i = 1; i < argc; i++) {
@@ -251,7 +270,7 @@ int main(int argc, char ** argv) {
         }
         const double t2 = now_ms();
         fprintf(stderr, "decoded %.2f s of audio (%d codebooks, %d frames)\n", (double) n / sr, n_q, n_frames);
-        fprintf(stderr, "load %.1f ms, decode %.1f ms\n", t1 - t0, t2 - t1);
+        fprintf(stderr, "load %.1f ms, decode %.1f ms (%s backend)\n", t1 - t0, t2 - t1, zencodec_backend());
         if (!write_wav(pos[3], audio, n, sr)) {
             fprintf(stderr, "error: cannot write '%s'\n", pos[3]);
             ret = 1;

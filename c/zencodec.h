@@ -20,6 +20,9 @@ int zencodec_sample_rate(const zencodec_model * model); // 24000
 int zencodec_hop_length (const zencodec_model * model); // 320 samples per frame
 int zencodec_n_codebooks(const zencodec_model * model); // 32 (max)
 
+// Name of the compute backend compiled in: "ref", "neon" or "accelerate".
+const char * zencodec_backend(void);
+
 // Decode `codes` laid out as [n_q][n_frames] (codebook-major) into
 // n_frames * hop_length mono float samples written to `audio`.
 // n_q may be any value in [1, n_codebooks]: 2 = 1.5 kbps, 4 = 3 kbps, 8 = 6 kbps,
