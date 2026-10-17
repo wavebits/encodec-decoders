@@ -305,7 +305,7 @@ def main():
                     m = re.search(d["decode_re"], err)
                     meas = {"wall": wall, "user": user, "sys": sys_, "peak": peak,
                             "decode": float(m.group(1)) / 1e3 if m else None}
-                    if inp in refs:
+                    if inp in refs and d is not py:  # PyTorch is the reference itself
                         meas["snr"], meas["snr_min"] = snr(refs[inp], read_wav(out))
                     samples.setdefault((d["name"], inp, t), []).append(meas)
                     print(f"run {r + 1}/{args.runs}  {d['name']:24s} {inp.name} -t {t}: "
@@ -371,8 +371,9 @@ def markdown(rows):
     for r in rows:
         dec = f"{r['decode_s']:.2f} s" if r["decode_s"] != "" else "—"
         rt = f"{r['realtime_x']}×" if r["realtime_x"] != "" else "—"
-        snr_ = f"{r['snr_db']} dB" if r["snr_db"] != "" else "—"
-        worst = f"{r['snr_min_1s_db']} dB" if r["snr_min_1s_db"] != "" else "—"
+        is_ref = r["backend"] == "torch"
+        snr_ = "reference" if is_ref else f"{r['snr_db']} dB" if r["snr_db"] != "" else "—"
+        worst = "reference" if is_ref else f"{r['snr_min_1s_db']} dB" if r["snr_min_1s_db"] != "" else "—"
         lines.append(f"| {r['decoder']} | {r['input']} ({r['audio_s']:g} s) | {r['threads']} "
                      f"| {r['wall_s']:.2f} s ({r['wall_min_s']:.2f}–{r['wall_max_s']:.2f}) | {dec} | {rt} "
                      f"| {r['user_s']:.2f} s | {r['peak_mb']:.0f} MB | {fmt_size(r['size_bytes'])} "

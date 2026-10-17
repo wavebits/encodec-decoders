@@ -21,19 +21,21 @@ Decoding 30 s of 6 kbps audio on an Apple M1 with 4 threads (median of 3 runs):
 
 | | FLMSBMP (C) | encodec.cpp | PyTorch `encodec` |
 | --- | --- | --- | --- |
-| 📦 Size to ship | **70 KB** | 905 KB | 529 MB + Python |
-| 🧠 Peak memory | **71 MB** | 1.09 GB | 2.17 GB |
-| ⚡ Time | 4.6 s | 6.1 s | **3.5 s** |
-| 🔌 Dependencies | **libc** | ggml + C++ runtime | Python + PyTorch |
+| 📦 Size to ship | **72 KB** | 905 KB | 518 MB + Python |
+| 🧠 Peak memory | **80 MB** | 1.09 GB | 2.17 GB |
+| ⚡ Time | **1.3 s** | 9.3 s | 5.3 s |
+| 🔌 Dependencies | **libc** (+ Accelerate on Apple) | ggml + C++ runtime | Python + PyTorch |
 
-- **Smallest:** 13× smaller than encodec.cpp, and thousands of times smaller than PyTorch.
-- **Lowest memory:** 15× less than encodec.cpp and 30× less than PyTorch. It also stays
+- **Fastest:** 4× faster than PyTorch and 7× faster than encodec.cpp. Counting only the
+  decoding, without startup, it is still 2× faster than PyTorch (1.15 s against 2.36 s).
+- **Lowest memory:** 14× less than encodec.cpp and 27× less than PyTorch. It also stays
   the same for any length of audio, while theirs grows.
-- **Fastest:** 1.3× faster than encodec.cpp, but **not yet faster than PyTorch** on this
-  Mac. PyTorch is about 1.3× faster here, because it hands its matrix math to Apple's
-  Accelerate library. Closing that gap is the first item on the [roadmap](#roadmap).
+- **Smallest:** 13× smaller than encodec.cpp, and thousands of times smaller than PyTorch.
+- **Most portable:** on ARM devices without Accelerate, the dependency-free NEON backend
+  takes 2.0 s here (1.85 s of decoding), still faster than PyTorch.
 
-See [Benchmarks](#benchmarks) for every measurement, the method, and how to reproduce them.
+These numbers use the `accelerate` backend, the default on Apple platforms. See
+[Benchmarks](#benchmarks) for every backend, the method, and how to reproduce them.
 
 ## Status
 
@@ -43,7 +45,8 @@ What works:
 - **Decoding only** (codes → waveform). Encoding still needs the Python `encodec` package.
 - Batch and **streaming** decoding: audio comes out in 1 s chunks, and playback starts
   after about 0.1 s.
-- CPU only. The code is portable, with SIMD from the compiler (C) or `@Vector` (Zig).
+- CPU only, with three C backends: portable C, hand-written NEON kernels, or Apple's
+  Accelerate. The Zig version uses `@Vector` SIMD.
 - Playback in the CLI on macOS (AudioToolbox) and Linux (`aplay`). The library itself
   does no audio I/O.
 
@@ -201,8 +204,10 @@ codes [n_q][T]
   → ELU, conv k7          32 → 1                                   → [T × 320] samples at 24 kHz
 ```
 
-There is no graph and no tensor library: each layer is a plain loop over `[C][T]`
-buffers. The convolutions are split across threads by output channel. Weights are stored in f16 and converted on load.
+There is no graph and no tensor library. Each layer is written as matrix products over
+`[C][T]` buffers, which the compiled-in backend runs (see
+[C compute backends](#c-compute-backends)). The LSTM recurrence is the only part that
+must run one frame at a time. Weights are stored in f16 and converted on load.
 See [docs/architecture.md](docs/architecture.md) for each layer, the streaming state, and
 which function implements what.
 
@@ -257,32 +262,49 @@ Setup for all results below (2026-10-17, Apple M1, 16 GB):
 - The machine had other work running, so times vary between sessions. Compare numbers
   within one table only. Memory and sizes are exact.
 
-### All four decoders, one session
+### All decoders and backends
 
-30 s of audio, 4 threads, 3 interleaved runs (load average 4–6):
+Commit `617db75`, 3 interleaved runs, load average 4.6–8.4. Full table with 10 s inputs:
+[bench/results/2026-10-17T1438_617db75.md](bench/results/2026-10-17T1438_617db75.md).
 
-| | Wall time | CPU time | Peak memory |
-| --- | --- | --- | --- |
-| wb_decode-c | 3.9–5.5 s (median 4.6) | 9.3–11.9 s | 69–77 MB |
-| wb_decode-zig | 3.7–4.0 s (median 3.9) | 8.3–9.5 s | 89–91 MB |
-| encodec.cpp | 6.1–6.9 s (median 6.1) | 22.1–22.8 s | 1.09 GB |
-| PyTorch `encodec` | 3.4–3.6 s (median 3.5) | 2.9–3.3 s | 2.17 GB |
+30 s of audio, median of 3 runs. "Decode" is the time each decoder reports for decoding
+alone, without process startup or model loading.
 
+| Decoder | Threads | Wall | Decode | × real time | CPU (user) | Peak memory | SNR | Worst 1 s |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| wb_decode-c (accelerate) | 1 | **1.00 s** | **0.92 s** | **32.5×** | 0.95 s | 77 MB | 27.3 dB | 13.7 dB |
+| wb_decode-c (accelerate) | 4 | 1.26 s | 1.15 s | 26.1× | 1.49 s | 80 MB | 27.3 dB | 13.7 dB |
+| wb_decode-c (neon) | 1 | 2.72 s | 2.64 s | 11.4× | 2.66 s | 79 MB | 27.3 dB | 13.7 dB |
+| wb_decode-c (neon) | 4 | 1.97 s | 1.85 s | 16.2× | 4.38 s | 81 MB | 27.3 dB | 13.7 dB |
+| wb_decode-c (ref) | 1 | 7.70 s | 7.61 s | 3.9× | 7.53 s | 76 MB | 27.3 dB | 13.7 dB |
+| wb_decode-c (ref) | 4 | 5.04 s | 4.95 s | 6.1× | 13.82 s | 78 MB | 27.3 dB | 13.7 dB |
+| wb_decode-c before backends (`b046831`) | 4 | 6.06 s | 5.97 s | 5.0× | 13.93 s | 74 MB | 27.3 dB | 13.7 dB |
+| wb_decode-zig | 4 | 6.64 s | 6.61 s | 4.5× | 15.35 s | 94 MB | 27.3 dB | 13.7 dB |
+| encodec.cpp | 4 | 9.33 s | 9.19 s | 3.3× | 27.72 s | 1.09 GB | 46.2 dB | 34.7 dB |
+| PyTorch `encodec` | 1 | 5.93 s | 3.02 s | 9.9× | 4.24 s | 2.17 GB | reference | reference |
+| PyTorch `encodec` | 4 | 5.28 s | 2.36 s | 12.7× | 4.63 s | 2.17 GB | reference | reference |
+
+- **accelerate** is the fastest decoder measured, and is fastest with one of our threads.
+  Accelerate runs its own threads on the matrix units, and more of ours only compete
+  with them.
+- **neon** needs no libraries and is about 2.7× faster than `ref`. It is also faster than
+  PyTorch's decoding. It is the backend for Android phones and other ARM boards.
+- **ref** is slightly faster than the code before the backends (5.0 s against 6.1 s), so
+  portable builds didn't lose anything.
+- **SNR:** all C backends give identical output. The low overall SNR on this clip comes
+  from one second that is very sensitive to f16 weight rounding (see
+  [Accuracy](#accuracy)); with the f32 weights every backend reaches 81.6 dB. encodec.cpp
+  keeps more of its weights in f32, so it scores higher on that second.
 - **PyTorch:**
-  - It is fastest here, and uses the least CPU time by far. Its CPU time is even below
-    its wall time, because Accelerate runs the matrix products on the M1's matrix
-    coprocessor (AMX), which doesn't show up as CPU time.
-  - It pays for this in memory: 953 MB for 10 s of audio and 2.17 GB for 30 s, because it
-    decodes the whole file at once.
-  - Its install is 529 MB of PyTorch, plus a Python runtime.
-  - On 1 thread it took 1.9–2.1 s for 10 s of audio, in the same range as the 1-thread
-    times in the next table.
-- **wb_decode-zig** was faster than wb_decode-c in this session, unlike the 4-thread runs
-  in the next table. The two are close, and the gap moves with machine load.
+  - Its wall time includes about 2 s of Python and PyTorch startup.
+  - Its install is 518 MB of PyTorch, plus a Python runtime.
+  - Its memory grows with the length of the audio: 953 MB for 10 s and 2.17 GB for 30 s.
+- **wb_decode-zig** doesn't have the backends yet.
 
 ### Thread scaling and memory growth, against encodec.cpp
 
-Earlier session, under heavier load (load average 4–16).
+Earlier session, at commit `d8a90e1` (before the backends), under heavier load (load
+average 4–16).
 
 **Wall time** (lower is better):
 
@@ -341,12 +363,12 @@ Upstream encodec.cpp needed four changes to decode these files correctly
 
 ## Roadmap
 
-- **Speed** (catch up with PyTorch on Apple Silicon):
-  - Register-blocked, GEMM-style kernels for the conv, transposed-conv and LSTM loops.
-    These loops are bound by loads and stores today, at about 2 GMAC/s per core.
-  - A persistent thread pool.
-  - An optional build that uses the platform's BLAS (Accelerate on Apple devices), for
-    apps that already link it.
+- **Speed:**
+  - Done: GEMM-based layers with `neon` and `accelerate` backends.
+  - The LSTM recurrence is now the largest stage, about a third of the time. Split its
+    matrix-vector product across threads, or overlap the two LSTM layers.
+  - A persistent thread pool, instead of creating threads for every layer.
+  - An `avx2` backend for x86, by porting the NEON kernels.
 - **Memory:** keep the weights in f16 and convert them inside the kernels, or use int8,
   to halve or quarter the resident size.
 - **Size:** int8 weights, so the shipped asset is about 12 MB.
