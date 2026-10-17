@@ -1,7 +1,7 @@
 """Compare a zencodec CLI (C or Zig) against the reference PyTorch EnCodec decoder.
 
 Usage:
-    python tests/compare.py zig-out/bin/zencodec-c weights/encodec_24khz_decoder_f16.bin
+    python tests/compare.py zig-out/bin/wb_decode-c weights/encodec_24khz_decoder_f16.bin
 """
 import argparse
 import struct

@@ -16,7 +16,7 @@ pub fn build(b: *std.Build) void {
         .flags = &.{ "-std=c17", "-Wall", "-Wextra", "-pedantic" },
     });
     if (is_macos) c_mod.linkFramework("AudioToolbox", .{});
-    const c_exe = b.addExecutable(.{ .name = "zencodec-c", .root_module = c_mod });
+    const c_exe = b.addExecutable(.{ .name = "wb_decode-c", .root_module = c_mod });
     b.installArtifact(c_exe);
 
     // Zig implementation
@@ -28,6 +28,6 @@ pub fn build(b: *std.Build) void {
         .link_libc = is_macos, // AudioToolbox
     });
     if (is_macos) zig_mod.linkFramework("AudioToolbox", .{});
-    const zig_exe = b.addExecutable(.{ .name = "zencodec-zig", .root_module = zig_mod });
+    const zig_exe = b.addExecutable(.{ .name = "wb_decode-zig", .root_module = zig_mod });
     b.installArtifact(zig_exe);
 }

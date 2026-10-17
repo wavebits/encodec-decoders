@@ -1,7 +1,7 @@
 //! zencodec CLI (Zig).
 //!
-//!   zencodec decode <weights.bin> <codes.bin|in.ecdc> <out.wav> [-t n_threads]
-//!   zencodec play   <weights.bin> <codes.bin|in.ecdc>           [-t n_threads]
+//!   wb_decode-zig decode <weights.bin> <codes.bin|in.ecdc> <out.wav> [-t n_threads]
+//!   wb_decode-zig play   <weights.bin> <codes.bin|in.ecdc>           [-t n_threads]
 //!
 //! Codes file (little-endian): int32 n_q, int32 n_frames, int32 codes[n_q][n_frames]
 //! (see scripts/encode.py), or an .ecdc file from `encodec` compressed without --lm.
@@ -12,8 +12,8 @@ const zencodec = @import("zencodec.zig");
 const play = @import("play.zig");
 
 const usage =
-    \\usage: zencodec decode <weights.bin> <codes.bin|in.ecdc> <out.wav> [-t n_threads]
-    \\       zencodec play   <weights.bin> <codes.bin|in.ecdc>           [-t n_threads]
+    \\usage: wb_decode-zig decode <weights.bin> <codes.bin|in.ecdc> <out.wav> [-t n_threads]
+    \\       wb_decode-zig play   <weights.bin> <codes.bin|in.ecdc>           [-t n_threads]
     \\
 ;
 

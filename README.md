@@ -1,30 +1,38 @@
-# zencodec
+# FLMSBMP Meta's EnCodec Decoder — by Wavebits
+
+**F**astest · **L**owest **M**emory · **S**mallest **B**inary · **M**ost **P**ortable
 
 ![EnCodec decoder](docs/encodec_decoder.png)
 
-**zencodec is the smallest, most portable, lowest-memory and fastest decoder for Meta's
-[EnCodec](https://github.com/facebookresearch/encodec) audio codec, made to be embedded in
-phones and other small devices.** EnCodec compresses speech and music to as little as
-1.5 kbps, but turning the codes back into sound normally takes PyTorch or
-[encodec.cpp](https://github.com/PABannier/encodec.cpp) with ggml. zencodec does the same
-job in two plain C files that need nothing beyond libc and threads, in memory that doesn't grow with the
-length of the audio. A second implementation in Zig gives the same output, so the two can
-be compared and the faster or smaller approach kept. The diagram above shows the decoder;
-[docs/architecture.md](docs/architecture.md) explains it layer by layer.
+**FLMSBMP is a decoder for Meta's [EnCodec](https://github.com/facebookresearch/encodec)
+audio codec, made to be embedded in phones and other small devices.** EnCodec compresses
+speech and music to as little as 1.5 kbps, but turning the codes back into sound normally
+takes Python with PyTorch, or [encodec.cpp](https://github.com/PABannier/encodec.cpp) with
+ggml. FLMSBMP does the same job in two plain C files that need nothing beyond libc and
+threads, in memory that doesn't grow with the length of the audio. A second implementation
+in Zig gives the same output, so the two can be compared and the faster or smaller
+approach kept. The command-line tools are `wb_decode-c` and `wb_decode-zig`. The diagram
+above shows the decoder; [docs/architecture.md](docs/architecture.md) explains it layer by
+layer.
 
 ## Benchmark at a glance
 
-zencodec (C) against encodec.cpp, decoding 30 s of 6 kbps audio on an Apple M1 (median
-of 3 runs):
+Decoding 30 s of 6 kbps audio on an Apple M1 with 4 threads (median of 3 runs):
 
-| | zencodec | encodec.cpp | |
+| | FLMSBMP (C) | encodec.cpp | PyTorch `encodec` |
 | --- | --- | --- | --- |
-| 📦 Binary size | **70 KB** | 905 KB | **13× smaller** |
-| 🧠 Memory | **72 MB** | 1.09 GB | **15× less** |
-| ⚡ Time (4 threads) | **8.3 s** | 15.0 s | **1.8× faster** |
-| 🔌 Dependencies | **libc** | ggml + C++ runtime | |
+| 📦 Size to ship | **70 KB** | 905 KB | 529 MB + Python |
+| 🧠 Peak memory | **71 MB** | 1.09 GB | 2.17 GB |
+| ⚡ Time | 4.6 s | 6.1 s | **3.5 s** |
+| 🔌 Dependencies | **libc** | ggml + C++ runtime | Python + PyTorch |
 
-zencodec's memory stays the same for any length of audio; encodec.cpp's grows with it.
+- **Smallest:** 13× smaller than encodec.cpp, and thousands of times smaller than PyTorch.
+- **Lowest memory:** 15× less than encodec.cpp and 30× less than PyTorch. It also stays
+  the same for any length of audio, while theirs grows.
+- **Fastest:** 1.3× faster than encodec.cpp, but **not yet faster than PyTorch** on this
+  Mac. PyTorch is about 1.3× faster here, because it hands its matrix math to Apple's
+  Accelerate library. Closing that gap is the first item on the [roadmap](#roadmap).
+
 See [Benchmarks](#benchmarks) for every measurement, the method, and how to reproduce them.
 
 ## Status
@@ -45,12 +53,12 @@ testing on phones. See the [roadmap](#roadmap).
 ## Quick start
 
 ```bash
-zig build -Dstrip=true                       # builds zig-out/bin/zencodec-c and zencodec-zig
+zig build -Dstrip=true                       # builds zig-out/bin/wb_decode-c and wb_decode-zig
 pip install torch numpy encodec torchaudio   # for the weights and for encoding
 python scripts/convert.py --use-f16          # downloads Meta's checkpoint → weights/encodec_24khz_decoder_f16.bin
 encodec -b 6 input.wav input.ecdc            # compress a WAV with Meta's reference CLI
-zig-out/bin/zencodec-c play   weights/encodec_24khz_decoder_f16.bin input.ecdc
-zig-out/bin/zencodec-c decode weights/encodec_24khz_decoder_f16.bin input.ecdc out.wav -t 4
+zig-out/bin/wb_decode-c play   weights/encodec_24khz_decoder_f16.bin input.ecdc
+zig-out/bin/wb_decode-c decode weights/encodec_24khz_decoder_f16.bin input.ecdc out.wav -t 4
 ```
 
 ## Build
@@ -67,13 +75,13 @@ zig build -Dtarget=aarch64-linux-musl        # cross-compile, e.g. for an ARM64 
 For the C version on its own, any C17 compiler works:
 
 ```bash
-cc -std=c17 -O3 c/*.c -lm -lpthread -framework AudioToolbox -o zencodec   # macOS
-cc -std=c17 -O3 c/*.c -lm -lpthread -o zencodec                           # Linux
+cc -std=c17 -O3 c/*.c -lm -lpthread -framework AudioToolbox -o wb_decode-c   # macOS
+cc -std=c17 -O3 c/*.c -lm -lpthread -o wb_decode-c                           # Linux
 ```
 
 Stripped sizes:
 
-| Target | zencodec-c | zencodec-zig |
+| Target | wb_decode-c | wb_decode-zig |
 | --- | --- | --- |
 | aarch64-macos | 70 KB | 323 KB |
 | aarch64-linux-musl (static, libc included) | 72 KB | 330 KB |
@@ -108,8 +116,8 @@ For budgeting:
 Both CLIs take the same commands:
 
 ```bash
-zencodec-c decode <weights.bin> <codes.bin|in.ecdc> <out.wav> [-t n_threads]
-zencodec-c play   <weights.bin> <codes.bin|in.ecdc>           [-t n_threads]
+wb_decode-c decode <weights.bin> <codes.bin|in.ecdc> <out.wav> [-t n_threads]
+wb_decode-c play   <weights.bin> <codes.bin|in.ecdc>           [-t n_threads]
 ```
 
 The input can be:
@@ -122,6 +130,9 @@ The input can be:
 chunk, so playback does not wait for the whole file.
 
 ## Library API
+
+The library keeps the `zencodec_` prefix (C) and `zencodec` module name (Zig) for its
+identifiers.
 
 C:
 
@@ -175,8 +186,8 @@ which function implements what.
 ## Accuracy
 
 ```bash
-python tests/compare.py zig-out/bin/zencodec-c   weights/encodec_24khz_decoder_f16.bin
-python tests/compare.py zig-out/bin/zencodec-zig weights/encodec_24khz_decoder_f16.bin
+python tests/compare.py zig-out/bin/wb_decode-c   weights/encodec_24khz_decoder_f16.bin
+python tests/compare.py zig-out/bin/wb_decode-zig weights/encodec_24khz_decoder_f16.bin
 ```
 
 Against the PyTorch decoder, both versions give an SNR of 55–63 dB with the f16 weights
@@ -194,21 +205,56 @@ To reproduce:
 bench/compare_encodec_cpp.sh input.ecdc [n_threads] [n_runs]
 ```
 
-The script clones encodec.cpp at a pinned commit into `bench/work/` and applies
-`bench/encodec_cpp.patch` (see below). It then builds both projects and prints wall
-time, CPU time, peak memory and binary size.
+The script:
 
-Results from 2026-10-17 on an M1 (16 GB):
+1. Clones encodec.cpp at a pinned commit into `bench/work/` and applies
+   `bench/encodec_cpp.patch` (see below).
+2. Builds both projects.
+3. Decodes the file with each decoder in turn, including PyTorch via
+   `bench/python_decode.py` if `encodec` and `torch` are installed.
+4. Prints wall time, CPU time, peak memory and binary size.
+
+Setup for all results below (2026-10-17, Apple M1, 16 GB):
 
 - encodec.cpp was at commit `83deb38` (ggml `c18f9bae`), built in Release mode with the
   CPU backend.
+- PyTorch was version 2.13.0 with `encodec` 0.1.1, built with Apple's Accelerate library
+  (`BLAS_INFO=accelerate`).
 - The input was 6 kbps `.ecdc` clips cut from a music file.
-- The machine was under heavy background load (load average 4–16), so treat the times as
-  rough. Memory and sizes are exact.
+- Times are for the whole process: loading the model, decoding, and writing the WAV.
+- The machine had other work running, so times vary between sessions. Compare numbers
+  within one table only. Memory and sizes are exact.
+
+### All four decoders, one session
+
+30 s of audio, 4 threads, 3 interleaved runs (load average 4–6):
+
+| | Wall time | CPU time | Peak memory |
+| --- | --- | --- | --- |
+| wb_decode-c | 3.9–5.5 s (median 4.6) | 9.3–11.9 s | 69–77 MB |
+| wb_decode-zig | 3.7–4.0 s (median 3.9) | 8.3–9.5 s | 89–91 MB |
+| encodec.cpp | 6.1–6.9 s (median 6.1) | 22.1–22.8 s | 1.09 GB |
+| PyTorch `encodec` | 3.4–3.6 s (median 3.5) | 2.9–3.3 s | 2.17 GB |
+
+- **PyTorch:**
+  - It is fastest here, and uses the least CPU time by far. Its CPU time is even below
+    its wall time, because Accelerate runs the matrix products on the M1's matrix
+    coprocessor (AMX), which doesn't show up as CPU time.
+  - It pays for this in memory: 953 MB for 10 s of audio and 2.17 GB for 30 s, because it
+    decodes the whole file at once.
+  - Its install is 529 MB of PyTorch, plus a Python runtime.
+  - On 1 thread it took 1.9–2.1 s for 10 s of audio, in the same range as the 1-thread
+    times in the next table.
+- **wb_decode-zig** was faster than wb_decode-c in this session, unlike the 4-thread runs
+  in the next table. The two are close, and the gap moves with machine load.
+
+### Thread scaling and memory growth, against encodec.cpp
+
+Earlier session, under heavier load (load average 4–16).
 
 **Wall time** (lower is better):
 
-| Case | zencodec-c | zencodec-zig | encodec.cpp |
+| Case | wb_decode-c | wb_decode-zig | encodec.cpp |
 | --- | --- | --- | --- |
 | 10 s audio, 1 thread\* | 1.67–2.04 s | 1.80–2.29 s | 1.94–2.20 s |
 | 10 s audio, 4 threads | 2.3–2.9 s | 3.0–3.2 s | 2.6–3.3 s |
@@ -218,31 +264,34 @@ Results from 2026-10-17 on an M1 (16 GB):
 \* Measured in a separate session at lower load (load average about 2.6), so compare
 this row only within itself.
 
-On a single core, zencodec-c is about 10–15% faster than encodec.cpp, and zencodec-zig
-is in between. At 4 threads, encodec.cpp uses about twice the
-CPU time, and at 8 threads it slows down sharply. Its graph has one node per LSTM step
-and frame, and its threads synchronize at every node. Its Metal backend (`-g 99`) was
-slower than its CPU backend: 9.5 s for 10 s of audio.
+- **1 thread:** wb_decode-c is about 10–15% faster than encodec.cpp, and wb_decode-zig is
+  in between.
+- **4 threads:** encodec.cpp uses about twice the CPU time.
+- **8 threads:** encodec.cpp slows down sharply. Its graph has one node per LSTM step and
+  frame, and its threads synchronize at every node.
+- **Metal:** encodec.cpp's Metal backend (`-g 99`) was slower than its CPU backend: 9.5 s
+  for 10 s of audio.
 
 **Peak memory** (`/usr/bin/time -l`, peak footprint):
 
-| Audio length | zencodec-c | zencodec-zig | encodec.cpp |
-| --- | --- | --- | --- |
-| 10 s | 71 MB | 92 MB | 377 MB |
-| 30 s | 72 MB | 93 MB | 1.09 GB |
+| Audio length | wb_decode-c | wb_decode-zig | encodec.cpp | PyTorch `encodec` |
+| --- | --- | --- | --- | --- |
+| 10 s | 71 MB | 92 MB | 377 MB | 953 MB |
+| 30 s | 72 MB | 93 MB | 1.09 GB | 2.17 GB |
 
-zencodec decodes in fixed-size chunks, so its memory does not change with the length of
-the audio. encodec.cpp builds one graph for the whole file, so its memory grows with the
-length of the audio.
+FLMSBMP decodes in fixed-size chunks, so its memory does not change with the length of
+the audio. encodec.cpp and PyTorch process the whole file at once, so their memory grows
+with the length of the audio. The PyTorch figures are from the session above.
 
 **Size** (macOS arm64):
 
 | | Binary (stripped) | Weights file |
 | --- | --- | --- |
-| zencodec-c | 70 KB | 23 MB (decoder only, f16) |
-| zencodec-zig | 323 KB | same file |
+| wb_decode-c | 70 KB | 23 MB (decoder only, f16) |
+| wb_decode-zig | 323 KB | same file |
 | encodec.cpp `decompress`, CPU only | 905 KB | 46.5 MB (encoder + decoder) |
 | encodec.cpp `decompress`, default build with Metal | 1.32 MB | same file |
+| PyTorch `encodec` | 529 MB `torch` package + 332 KB `encodec` + Python | 93 MB checkpoint |
 
 Upstream encodec.cpp needed four changes to decode these files correctly
 (`bench/encodec_cpp.patch`):
@@ -260,10 +309,12 @@ Upstream encodec.cpp needed four changes to decode these files correctly
 
 ## Roadmap
 
-- **Speed:**
+- **Speed** (catch up with PyTorch on Apple Silicon):
   - Register-blocked, GEMM-style kernels for the conv, transposed-conv and LSTM loops.
     These loops are bound by loads and stores today, at about 2 GMAC/s per core.
   - A persistent thread pool.
+  - An optional build that uses the platform's BLAS (Accelerate on Apple devices), for
+    apps that already link it.
 - **Memory:** keep the weights in f16 and convert them inside the kernels, or use int8,
   to halve or quarter the resident size.
 - **Size:** int8 weights, so the shipped asset is about 12 MB.
@@ -316,7 +367,7 @@ file, pass `--out`. The f32 file matches PyTorch to within 16-bit WAV rounding.
 | `scripts/convert.py` | Downloads Meta's checkpoint and builds the weights file |
 | `scripts/encode.py` | WAV → raw codes file, using the reference `encodec` package |
 | `tests/compare.py` | Checks a CLI's output against the PyTorch decoder |
-| `bench/` | Benchmark against encodec.cpp (script and patch) |
+| `bench/` | Benchmark against encodec.cpp and PyTorch (scripts and patch) |
 | `docs/` | Decoder architecture document and diagram |
 | `build.zig` | Builds both CLIs, natively or cross-compiled |
 | `LICENSE` | MIT License for the code |
@@ -327,7 +378,7 @@ The decoder follows the structure of
 [encodec.cpp](https://github.com/PABannier/encodec.cpp) by Pierre-Antoine Bannier, and
 the model is [EnCodec](https://github.com/facebookresearch/encodec) by Meta AI.
 
-The zencodec code is released under the [MIT License](LICENSE).
+The FLMSBMP code is released under the [MIT License](LICENSE).
 
 The EnCodec weights are released by Meta under
 [CC-BY-NC 4.0](https://github.com/facebookresearch/encodec#license). For that reason this

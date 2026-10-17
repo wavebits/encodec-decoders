@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Compare zencodec (C and Zig) with encodec.cpp: wall time, CPU time, peak memory, binary size.
+# Compare wb_decode (C and Zig) with encodec.cpp and the PyTorch `encodec` package:
+# wall time, CPU time, peak memory, binary size.
 #
 # Usage:
 #   bench/compare_encodec_cpp.sh <in.ecdc> [n_threads] [n_runs]
@@ -25,8 +26,8 @@ mkdir -p "$WORK"
 
 # --- zencodec
 (cd "$ROOT" && zig build -Dstrip=true)
-ZC=$ROOT/zig-out/bin/zencodec-c
-ZZ=$ROOT/zig-out/bin/zencodec-zig
+ZC=$ROOT/zig-out/bin/wb_decode-c
+ZZ=$ROOT/zig-out/bin/wb_decode-zig
 ZW=$ROOT/weights/encodec_24khz_decoder_f16.bin
 [ -f "$ZW" ] || python "$ROOT/scripts/convert.py" --use-f16 --out "$ZW"
 
@@ -70,10 +71,15 @@ measure() { # name, command...
 }
 
 size_of() { wc -c < "$1" | tr -d ' '; }
-echo "binary size: zencodec-c $(size_of "$ZC") B, zencodec-zig $(size_of "$ZZ") B, encodec.cpp $(size_of "$EC") B"
+echo "binary size: wb_decode-c $(size_of "$ZC") B, wb_decode-zig $(size_of "$ZZ") B, encodec.cpp $(size_of "$EC") B"
+PY_ENCODEC=$(python -c "import encodec, torch; print(1)" 2>/dev/null || true)
+[ -n "$PY_ENCODEC" ] || echo "(pip install encodec torch to include the PyTorch decoder)"
 echo "input: $ECDC, $THREADS threads, $RUNS runs (interleaved)"
 for _ in $(seq "$RUNS"); do
-    measure zencodec-c   "$ZC" decode "$ZW" "$ECDC" "$WORK/out_zc.wav" -t "$THREADS"
-    measure zencodec-zig "$ZZ" decode "$ZW" "$ECDC" "$WORK/out_zz.wav" -t "$THREADS"
+    measure wb_decode-c  "$ZC" decode "$ZW" "$ECDC" "$WORK/out_zc.wav" -t "$THREADS"
+    measure wb_decode-zig "$ZZ" decode "$ZW" "$ECDC" "$WORK/out_zz.wav" -t "$THREADS"
     measure encodec.cpp  "$EC" -m "$EW" -i "$ECDC" -o "$WORK/out_ec.wav" -t "$THREADS"
+    if [ -n "$PY_ENCODEC" ]; then
+        measure pytorch  python "$ROOT/bench/python_decode.py" "$ECDC" "$WORK/out_py.wav" -t "$THREADS"
+    fi
 done
