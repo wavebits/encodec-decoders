@@ -15,7 +15,7 @@ of them alike. Results go to:
 
 Usage:
     python bench/bench.py in.ecdc [more.ecdc ...] [-t 1,4] [-r 3]
-        [--backends ref,neon,accelerate] [--baseline <git rev>]
+        [--backends ref,neon,accelerate,neon+f16,ref+f16] [--baseline <git rev>]
         [--no-encodec-cpp] [--no-pytorch] [--note "text"]
 
 Make inputs with `encodec -b 6 input.wav in.ecdc` (24 kHz model, no --lm).
@@ -98,8 +98,16 @@ def load_average():
 
 def default_backends():
     if platform.system() == "Darwin":
-        return ["ref", "neon", "accelerate"] if platform.machine() == "arm64" else ["ref", "accelerate"]
-    return ["ref", "neon"] if platform.machine() in ("aarch64", "arm64") else ["ref"]
+        if platform.machine() == "arm64":
+            return ["ref", "neon", "accelerate", "neon+f16", "ref+f16"]
+        return ["ref", "accelerate", "ref+f16"]
+    return ["ref", "neon", "neon+f16", "ref+f16"] if platform.machine() in ("aarch64", "arm64") else ["ref", "ref+f16"]
+
+
+def zig_flags(backend):
+    """Build flags for a backend name such as "neon" or "neon+f16" (f16 weights in memory)."""
+    name, _, variant = backend.partition("+")
+    return [f"-Dbackend={name}"] + (["-Df16=true"] if variant == "f16" else [])
 
 
 def build_flmsbmp(backends):
@@ -107,15 +115,16 @@ def build_flmsbmp(backends):
     decoders = []
     for i, backend in enumerate(backends):
         prefix = WORK / f"build-{backend}"
-        run(["zig", "build", f"-Dbackend={backend}", "-Dstrip=true", "-p", str(prefix)], cwd=ROOT)
+        run(["zig", "build", *zig_flags(backend), "-Dstrip=true", "-p", str(prefix)], cwd=ROOT)
         decoders.append(cli_decoder(f"wb_decode-c ({backend})", prefix / "bin" / "wb_decode-c", backend))
         if i == 0:
             decoders.append(cli_decoder("wb_decode-zig", prefix / "bin" / "wb_decode-zig", "zig"))
     return decoders
 
 
-def build_baseline(rev):
-    """Builds wb_decode-c from an earlier git revision, for before/after comparisons."""
+def build_baseline(rev, backends):
+    """Builds wb_decode-c from an earlier git revision, once per backend if that revision
+    has backends, for before/after comparisons. Returns decoder specs."""
     sha = sh(f"git -C {ROOT} rev-parse --short {rev}")
     if not sha:
         sys.exit(f"error: unknown git revision {rev}")
@@ -124,9 +133,19 @@ def build_baseline(rev):
         tree.mkdir(parents=True)
         archive = subprocess.run(["git", "-C", str(ROOT), "archive", sha], check=True, capture_output=True).stdout
         run(["tar", "-x", "-C", str(tree)], input=archive)
-    run(["zig", "build", "-Dstrip=true"], cwd=tree)
-    exe = next(p for p in (tree / "zig-out" / "bin").iterdir() if p.name in ("wb_decode-c", "zencodec-c"))
-    return cli_decoder(f"wb_decode-c @{sha}", exe, f"@{sha}")
+    if "backend" not in (tree / "build.zig").read_text():  # before the backends existed
+        run(["zig", "build", "-Dstrip=true"], cwd=tree)
+        exe = next(p for p in (tree / "zig-out" / "bin").iterdir() if p.name in ("wb_decode-c", "zencodec-c"))
+        return [cli_decoder(f"wb_decode-c @{sha}", exe, f"@{sha}")]
+    decoders = []
+    has_f16 = '"f16"' in (tree / "build.zig").read_text()
+    for backend in backends:
+        if "+f16" in backend and not has_f16:
+            continue
+        prefix = tree / f"build-{backend}"
+        run(["zig", "build", *zig_flags(backend), "-Dstrip=true", "-p", str(prefix)], cwd=tree)
+        decoders.append(cli_decoder(f"wb_decode-c ({backend}) @{sha}", prefix / "bin" / "wb_decode-c", f"{backend}@{sha}"))
+    return decoders
 
 
 def cli_decoder(name, exe, backend):
@@ -272,9 +291,13 @@ def main():
         run([sys.executable, str(ROOT / "scripts" / "convert.py"), "--use-f16", "--out", str(WEIGHTS)])
 
     print("building ...", file=sys.stderr)
-    decoders = build_flmsbmp(args.backends.split(",") if args.backends else default_backends())
-    if args.baseline:
-        decoders.append(build_baseline(args.baseline))
+    backends = args.backends.split(",") if args.backends else default_backends()
+    decoders = build_flmsbmp(backends)
+    if args.baseline:  # each baseline build goes right after the current build of its backend
+        for base in build_baseline(args.baseline, backends):
+            after = next((i for i, d in enumerate(decoders) if base["backend"].startswith(d["backend"] + "@")),
+                         len(decoders) - 1)
+            decoders.insert(after + 1, base)
     if not args.no_encodec_cpp:
         decoders.append(build_encodec_cpp())
     py = None if args.no_pytorch else pytorch_decoder()

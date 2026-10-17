@@ -39,6 +39,9 @@ typedef struct zencodec_stream zencodec_stream;
 
 #define ZENCODEC_CHUNK_FRAMES 75 // 1 s; a good chunk size for zencodec_stream_decode
 
+// A stream with n_threads > 1 starts n_threads - 1 worker threads, which it keeps until
+// zencodec_stream_free. Between calls they spin for about 100 us, then sleep. Use a
+// stream from one thread at a time.
 zencodec_stream * zencodec_stream_new (const zencodec_model * model, int n_q, int n_threads); // NULL on failure
 void              zencodec_stream_free(zencodec_stream * stream);
 

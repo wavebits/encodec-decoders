@@ -5,6 +5,12 @@
 // FMAs instead of one. Weights are packed once at load into 8-row panels ([K][8]);
 // the input is packed per task into 12-column panels ([K][12]). Work is split into
 // MB x NB tiles of C, one task each.
+//
+// With ZENCODEC_F16_WEIGHTS the panels hold halves. The GEMV, which is bound by memory
+// bandwidth, widens them as it loads them (FCVTL), so it reads half the bytes. The GEMM
+// is bound by arithmetic instead, so it widens each 8-row panel of A once into an f32
+// buffer on the stack and runs the f32 micro-kernel on it over all of the tile's
+// columns: the conversion is spread over NB columns.
 
 #if defined(ZENCODEC_BACKEND_NEON)
 
@@ -18,13 +24,27 @@
 #define NR 12 // columns per micro-kernel (B panel width)
 #define MB 64 // rows per task, a multiple of MR
 #define NB 96 // columns per task, a multiple of NR
+#define MAX_K_F16 1024 // largest K packed with f16 weights (one widened panel is 32 KB of stack)
+
+// Loads 8 weights starting at p as two float32x4_t, lo and hi.
+#ifdef ZENCODEC_F16_WEIGHTS
+#define LOAD8(p, lo, hi)                                                  \
+    const float16x8_t lo##_h = vreinterpretq_f16_u16(vld1q_u16(p));      \
+    const float32x4_t lo = vcvt_f32_f16(vget_low_f16(lo##_h));            \
+    const float32x4_t hi = vcvt_high_f32_f16(lo##_h)
+#else
+#define LOAD8(p, lo, hi) const float32x4_t lo = vld1q_f32(p), hi = vld1q_f32((p) + 4)
+#endif
 
 // Matrices whose block height is not a multiple of MR (only the 1-channel output
 // conv) stay row-major and use the reference code.
 bool zc_mat_prepare(zc_mat * a) {
+#ifdef ZENCODEC_F16_WEIGHTS
+    if (a->K > MAX_K_F16) return true;
+#endif
     if (a->M % MR) return true;
     const int panels = a->taps * a->M / MR;
-    float * p = malloc((size_t) panels * MR * a->K * sizeof(float));
+    zc_weight * p = malloc((size_t) panels * MR * a->K * sizeof(zc_weight));
     if (!p) return false;
     for (int pi = 0; pi < panels; pi++)
         for (int k = 0; k < a->K; k++)
@@ -102,12 +122,21 @@ static void gemm_tile(void * p, int i) {
                 for (int j = cols; j < NR; j++) dst[(size_t) k * NR + j] = 0.0f;
             }
         }
-        const float * ap = (const float *) c->a->packed + ((size_t) tap * M + m0) * K;
-        for (int q = 0; q < nq; q++) {
-            const int cols = nb - q * NR < NR ? nb - q * NR : NR;
-            const float * b = bp + (size_t) q * K * NR;
-            for (int r = 0; r < mb; r += MR) {
-                const float * a = ap + (size_t) r * K;
+        const zc_weight * ap = (const zc_weight *) c->a->packed + ((size_t) tap * M + m0) * K;
+        for (int r = 0; r < mb; r += MR) {
+#ifdef ZENCODEC_F16_WEIGHTS
+            float a[MR * MAX_K_F16]; // zc_mat_prepare keeps K <= MAX_K_F16 when packing
+            for (int j = 0; j < MR * K; j += 8) {
+                LOAD8(ap + (size_t) r * K + j, lo, hi);
+                vst1q_f32(a + j, lo);
+                vst1q_f32(a + j + 4, hi);
+            }
+#else
+            const float * a = ap + (size_t) r * K;
+#endif
+            for (int q = 0; q < nq; q++) {
+                const int cols = nb - q * NR < NR ? nb - q * NR : NR;
+                const float * b = bp + (size_t) q * K * NR;
                 float * cc = c->C + (size_t) (m0 + r) * c->ldc + n0 + q * NR;
                 if (cols == NR) {
                     kernel_8x12(K, a, b, cc, c->ldc);
@@ -123,44 +152,49 @@ static void gemm_tile(void * p, int i) {
     free(bp);
 }
 
-void zc_gemm(const zc_mat * a, int N, const float * B, int ldb, float * C, int ldc, int n_threads) {
+void zc_gemm(const zc_mat * a, int N, const float * B, int ldb, float * C, int ldc, zc_pool * pool) {
     if (!a->packed) {
-        zc_ref_gemm(a, N, B, ldb, C, ldc, n_threads);
+        zc_ref_gemm(a, N, B, ldb, C, ldc, pool);
         return;
     }
     const int tiles_m = (a->M + MB - 1) / MB, tiles_n = (N + NB - 1) / NB;
     neon_ctx ctx = {a, N, ldb, ldc, tiles_n, B, C};
-    zc_parallel_for(tiles_m * tiles_n, n_threads, gemm_tile, &ctx);
+    zc_pool_run(pool, tiles_m * tiles_n, gemm_tile, &ctx);
 }
 
 // y += A x over the packed panels; 4-way unrolled over K to hide FMA latency.
-void zc_gemv(const zc_mat * a, const float * x, float * y) {
+void zc_gemv(const zc_mat * a, int row0, int rows, const float * x, float * y) {
     if (!a->packed) {
-        zc_ref_gemv(a, x, y);
+        zc_ref_gemv(a, row0, rows, x, y);
         return;
     }
     const int K = a->K;
-    for (int pi = 0; pi < a->M / MR; pi++) {
-        const float * p = (const float *) a->packed + (size_t) pi * K * MR;
+    for (int pi = 0; pi < rows / MR; pi++) {
+        const zc_weight * p = (const zc_weight *) a->packed + (size_t) (row0 / MR + pi) * K * MR;
         float32x4_t lo[4] = {vdupq_n_f32(0), vdupq_n_f32(0), vdupq_n_f32(0), vdupq_n_f32(0)};
         float32x4_t hi[4] = {vdupq_n_f32(0), vdupq_n_f32(0), vdupq_n_f32(0), vdupq_n_f32(0)};
         int k = 0;
         for (; k + 4 <= K; k += 4) {
             const float32x4_t xv = vld1q_f32(x + k);
-            lo[0] = vfmaq_laneq_f32(lo[0], vld1q_f32(p + 0),  xv, 0);
-            hi[0] = vfmaq_laneq_f32(hi[0], vld1q_f32(p + 4),  xv, 0);
-            lo[1] = vfmaq_laneq_f32(lo[1], vld1q_f32(p + 8),  xv, 1);
-            hi[1] = vfmaq_laneq_f32(hi[1], vld1q_f32(p + 12), xv, 1);
-            lo[2] = vfmaq_laneq_f32(lo[2], vld1q_f32(p + 16), xv, 2);
-            hi[2] = vfmaq_laneq_f32(hi[2], vld1q_f32(p + 20), xv, 2);
-            lo[3] = vfmaq_laneq_f32(lo[3], vld1q_f32(p + 24), xv, 3);
-            hi[3] = vfmaq_laneq_f32(hi[3], vld1q_f32(p + 28), xv, 3);
+            LOAD8(p + 0,  w0l, w0h);
+            LOAD8(p + 8,  w1l, w1h);
+            LOAD8(p + 16, w2l, w2h);
+            LOAD8(p + 24, w3l, w3h);
+            lo[0] = vfmaq_laneq_f32(lo[0], w0l, xv, 0);
+            hi[0] = vfmaq_laneq_f32(hi[0], w0h, xv, 0);
+            lo[1] = vfmaq_laneq_f32(lo[1], w1l, xv, 1);
+            hi[1] = vfmaq_laneq_f32(hi[1], w1h, xv, 1);
+            lo[2] = vfmaq_laneq_f32(lo[2], w2l, xv, 2);
+            hi[2] = vfmaq_laneq_f32(hi[2], w2h, xv, 2);
+            lo[3] = vfmaq_laneq_f32(lo[3], w3l, xv, 3);
+            hi[3] = vfmaq_laneq_f32(hi[3], w3h, xv, 3);
             p += 4 * MR;
         }
         for (; k < K; k++) {
             const float32x4_t xv = vdupq_n_f32(x[k]);
-            lo[0] = vfmaq_f32(lo[0], vld1q_f32(p), xv);
-            hi[0] = vfmaq_f32(hi[0], vld1q_f32(p + 4), xv);
+            LOAD8(p, wl, wh);
+            lo[0] = vfmaq_f32(lo[0], wl, xv);
+            hi[0] = vfmaq_f32(hi[0], wh, xv);
             p += MR;
         }
         const float32x4_t l = vaddq_f32(vaddq_f32(lo[0], lo[1]), vaddq_f32(lo[2], lo[3]));
@@ -170,6 +204,6 @@ void zc_gemv(const zc_mat * a, const float * x, float * y) {
     }
 }
 
-const char * zc_backend_name(void) { return "neon"; }
+const char * zc_backend_name(void) { return "neon" ZC_WEIGHTS_SUFFIX; }
 
 #endif

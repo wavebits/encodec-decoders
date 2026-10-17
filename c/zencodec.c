@@ -11,15 +11,11 @@
 #ifdef ZENCODEC_PROFILE
 #define _POSIX_C_SOURCE 200809L // clock_gettime
 #endif
-#ifdef __APPLE__
-#define _DARWIN_C_SOURCE // pthread QoS
-#endif
 
 #include "zencodec.h"
 #include "backend.h"
 
 #include <math.h>
-#include <pthread.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,8 +32,9 @@ typedef struct {
     char    name[96];
     int     n_dims;
     int     shape[4]; // PyTorch order (outermost first)
-    size_t  numel;
-    float * data;
+    size_t      numel;
+    zc_weight * data; // f32, or f16 with ZENCODEC_F16_WEIGHTS (matrices and codebooks)
+    float     * f;    // 0- and 1-D tensors (biases) instead: always f32, they are tiny
 } tensor;
 
 typedef struct {
@@ -53,9 +50,15 @@ typedef struct {
     int            C_in, C_out, K;
 } conv;
 
+// Gate rows are stored unit-block-major rather than PyTorch's [i; f; g; o]: row
+// (b * 4 + g) * LSTM_U + u holds gate g of hidden unit b * LSTM_U + u. Any run of whole
+// blocks then holds all four gates of its units, so the recurrence can be split across
+// threads by hidden unit (see lstm_step).
+#define LSTM_U ZC_GEMV_ROWS
+
 typedef struct {
-    zc_mat         w_ih, w_hh; // [4H][H] each
-    const tensor * b_ih, * b_hh;
+    zc_mat  w_ih, w_hh; // [4H][H] each, rows reordered as above
+    float * bias;       // b_ih + b_hh, [4H], reordered as above
 } lstm_layer;
 
 typedef struct {
@@ -103,29 +106,6 @@ static double now_ms(void) {
 // ---------------------------------------------------------------------------
 // helpers
 
-static float fp16_to_fp32(uint16_t h) {
-    const uint32_t sign = (uint32_t) (h & 0x8000) << 16;
-    uint32_t exp  = (h >> 10) & 0x1f;
-    uint32_t mant = h & 0x3ff;
-    uint32_t bits;
-    if (exp == 0) {
-        if (mant == 0) {
-            bits = sign;
-        } else { // subnormal: renormalize
-            exp = 127 - 15 + 1;
-            while (!(mant & 0x400)) { mant <<= 1; exp--; }
-            bits = sign | (exp << 23) | ((mant & 0x3ff) << 13);
-        }
-    } else if (exp == 0x1f) {
-        bits = sign | 0x7f800000 | (mant << 13);
-    } else {
-        bits = sign | ((exp + 127 - 15) << 23) | (mant << 13);
-    }
-    float f;
-    memcpy(&f, &bits, sizeof(f));
-    return f;
-}
-
 static act act_new(int C, int T) {
     act a = {C, T, calloc((size_t) C * T, sizeof(float))};
     return a;
@@ -166,59 +146,9 @@ static void elu_row(void * p, int c) {
     }
 }
 
-static void elu(act * x, int n_threads);
-
-// ---------------------------------------------------------------------------
-// parallel_for over [0, n) using pthreads
-
-typedef struct {
-    zc_task_fn      fn;
-    void          * ctx;
-    int             n;
-    int             next;
-    pthread_mutex_t lock;
-} task_pool;
-
-static void * pool_worker(void * arg) {
-    task_pool * p = arg;
-    for (;;) {
-        pthread_mutex_lock(&p->lock);
-        const int i = p->next++;
-        pthread_mutex_unlock(&p->lock);
-        if (i >= p->n) return NULL;
-        p->fn(p->ctx, i);
-    }
-}
-
-void zc_parallel_for(int n, int n_threads, zc_task_fn fn, void * ctx) {
-    if (n_threads > n) n_threads = n;
-    if (n_threads <= 1) {
-        for (int i = 0; i < n; i++) fn(ctx, i);
-        return;
-    }
-    task_pool p = {fn, ctx, n, 0, PTHREAD_MUTEX_INITIALIZER};
-    pthread_t threads[64];
-    if (n_threads > 64) n_threads = 64;
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-#ifdef __APPLE__
-    // run workers at the caller's QoS, so they get the same (performance or
-    // efficiency) cores as the calling thread
-    pthread_attr_set_qos_class_np(&attr, qos_class_self(), 0);
-#endif
-    int spawned = 0;
-    for (int t = 1; t < n_threads; t++) {
-        if (pthread_create(&threads[spawned], &attr, pool_worker, &p) == 0) spawned++;
-    }
-    pthread_attr_destroy(&attr);
-    pool_worker(&p);
-    for (int t = 0; t < spawned; t++) pthread_join(threads[t], NULL);
-    pthread_mutex_destroy(&p.lock);
-}
-
-static void elu(act * x, int n_threads) {
+static void elu(act * x, zc_pool * pool) {
     PROF_BEGIN();
-    zc_parallel_for(x->C, n_threads, elu_row, x);
+    zc_pool_run(pool, x->C, elu_row, x);
     PROF_END(P_ELU);
 }
 
@@ -250,7 +180,7 @@ static act pad_reflect(const act * x, int left, int right) {
 // `hist` carries the last K - 1 input samples from one chunk to the next. On the
 // first chunk (hist->d == NULL) the input is reflect-padded instead, as in encodec.
 // Unused (may be NULL) when K == 1.
-static act conv1d(const act * x, const conv * cv, act * hist, int n_threads) {
+static act conv1d(const act * x, const conv * cv, act * hist, zc_pool * pool) {
     PROF_BEGIN();
     const int C_in = cv->C_in, K = cv->K;
 
@@ -273,9 +203,9 @@ static act conv1d(const act * x, const conv * cv, act * hist, int n_threads) {
     // out = bias, then out += sum over taps k of W_k * in[:, k : k + T]
     act out = act_new(cv->C_out, x->T);
     for (int c = 0; c < cv->C_out; c++)
-        for (int t = 0; t < x->T; t++) row(&out, c)[t] = cv->b->data[c];
+        for (int t = 0; t < x->T; t++) row(&out, c)[t] = cv->b->f[c];
     const act * in = K > 1 ? &padded : x;
-    zc_gemm(&cv->w, x->T, in->d, in->T, out.d, x->T, n_threads);
+    zc_gemm(&cv->w, x->T, in->d, in->T, out.d, x->T, pool);
 
     act_free(&padded);
     PROF_END(P_CONV);
@@ -298,7 +228,7 @@ static void convtr_scatter(void * p, int co) {
     float * dst  = row(c->out, co);
     float * tail = row(c->tail, co);
     float next[64] = {0}; // K - stride <= 64
-    const float b = c->cv->b->data[co];
+    const float b = c->cv->b->f[co];
     for (int i = 0; i < L; i++) dst[i] = b;
     for (int k = 0; k < K; k++) {
         const float * z = row(c->z, k * C_out + co);
@@ -320,54 +250,104 @@ static void convtr_scatter(void * p, int co) {
 // encodec's causal trim.
 // Computed as one GEMM, z = W * x with W: [K * C_out][C_in], followed by an
 // overlap-add of the K taps.
-static act conv_transpose1d(const act * x, const conv * cv, act * tail, int stride, int n_threads) {
+static act conv_transpose1d(const act * x, const conv * cv, act * tail, int stride, zc_pool * pool) {
     PROF_BEGIN();
     act z = act_new(cv->K * cv->C_out, x->T);
-    zc_gemm(&cv->w, x->T, x->d, x->T, z.d, x->T, n_threads);
+    zc_gemm(&cv->w, x->T, x->d, x->T, z.d, x->T, pool);
 
     act out = act_new(cv->C_out, x->T * stride);
     convtr_ctx ctx = {&z, &out, tail, cv, stride};
-    zc_parallel_for(cv->C_out, n_threads, convtr_scatter, &ctx);
+    zc_pool_run(pool, cv->C_out, convtr_scatter, &ctx);
     act_free(&z);
     PROF_END(P_CONVT);
     return out;
 }
 
+typedef struct {
+    const lstm_layer * l;
+    const float      * xg;    // this step's input projections W_ih x(t) + b, [4H]
+    const float      * h_in;  // h(t - 1), [H]
+    float            * h_out; // h(t), [H]
+    float            * c;     // cell state, [H], updated in place
+    float            * gates; // scratch, [4H]
+    act              * y;     // output, [H][T]
+    int                t, H, n_tasks;
+} lstm_step_ctx;
+
+// Cell update for one block of LSTM_U units, from its gates g = [i; f; g; o] (each
+// LSTM_U long). A separate function, with restrict pointers, so that it vectorizes.
+static void lstm_cell(const float * restrict g, float * restrict c, float * restrict h) {
+    for (int u = 0; u < LSTM_U; u++) {
+        const float ig = sigmoid(g[u]);
+        const float fg = sigmoid(g[LSTM_U + u]);
+        const float gg = tanh_approx(g[2 * LSTM_U + u]);
+        const float og = sigmoid(g[3 * LSTM_U + u]);
+        c[u] = fg * c[u] + ig * gg;
+        h[u] = og * tanh_approx(c[u]);
+    }
+}
+
+// One LSTM time step for task i's share of the hidden units: its gate rows of
+// W_hh h(t - 1), then the cell update for its units. Tasks share nothing but h(t - 1),
+// which they only read, so a step needs no synchronization beyond the pool's join.
+static void lstm_step(void * p, int i) {
+    const lstm_step_ctx * s = p;
+    const int n_blocks = s->H / LSTM_U;
+    const int b0 = i * n_blocks / s->n_tasks, b1 = (i + 1) * n_blocks / s->n_tasks;
+    const int r0 = b0 * 4 * LSTM_U, rows = (b1 - b0) * 4 * LSTM_U;
+
+    float * g = s->gates + r0;
+    memcpy(g, s->xg + r0, (size_t) rows * sizeof(float));
+    zc_gemv(&s->l->w_hh, r0, rows, s->h_in, g);
+    for (int b = b0; b < b1; b++, g += 4 * LSTM_U)
+        lstm_cell(g, s->c + b * LSTM_U, s->h_out + b * LSTM_U);
+    for (int j = b0 * LSTM_U; j < b1 * LSTM_U; j++) row(s->y, j)[s->t] = s->h_out[j];
+}
+
 // Single LSTM layer, channel-major: x and y are [H][T].
 // h and c ([H] each) carry the state across chunks.
-static void lstm_forward(const act * x, act * y, const lstm_layer * l, float * h, float * c, int n_threads) {
-    const int H = x->C, T = x->T, G = 4 * H; // gates i, f, g, o
+static void lstm_forward(const act * x, act * y, const lstm_layer * l, float * h, float * c, zc_pool * pool) {
+    const int H = x->C, T = x->T, G = 4 * H;
 
     // input projections for all timesteps at once: xg = W_ih x + b_ih + b_hh, [4H][T]
     PROF_BEGIN();
     act xg = act_new(G, T);
-    for (int g = 0; g < G; g++) {
-        const float b = l->b_ih->data[g] + l->b_hh->data[g];
-        for (int t = 0; t < T; t++) row(&xg, g)[t] = b;
-    }
-    zc_gemm(&l->w_ih, T, x->d, T, xg.d, T, n_threads);
+    for (int g = 0; g < G; g++)
+        for (int t = 0; t < T; t++) row(&xg, g)[t] = l->bias[g];
+    zc_gemm(&l->w_ih, T, x->d, T, xg.d, T, pool);
+    // time-major copy, so each step reads its 4H projections contiguously; in 16 x 16
+    // tiles, so both sides are read and written a cache line at a time
+    float * xg_t = malloc((size_t) T * G * sizeof(float));
+    for (int g0 = 0; g0 < G; g0 += 16)
+        for (int t0 = 0; t0 < T; t0 += 16)
+            for (int g = g0; g < g0 + 16 && g < G; g++)
+                for (int t = t0; t < t0 + 16 && t < T; t++) xg_t[(size_t) t * G + g] = row(&xg, g)[t];
+    act_free(&xg);
     PROF_END(P_LSTM_IN);
 
+    // the recurrence: one fork-join per step, split by hidden unit. Two tasks per
+    // thread, so a thread that is slow to start (preempted, or still waking up) holds
+    // up only a small share of the step; one task (one full GEMV) when single-threaded.
     {
         PROF_BEGIN();
-        float * gates = malloc(G * sizeof(float));
+        float * scratch = malloc((size_t) (G + H) * sizeof(float));
+        const int n_threads = zc_pool_threads(pool);
+        int n_tasks = n_threads > 1 ? 2 * n_threads : 1;
+        if (n_tasks > H / LSTM_U) n_tasks = H / LSTM_U;
+        lstm_step_ctx ctx = {l, NULL, h, scratch + G, c, scratch, y, 0, H, n_tasks};
         for (int t = 0; t < T; t++) {
-            for (int g = 0; g < G; g++) gates[g] = row(&xg, g)[t];
-            zc_gemv(&l->w_hh, h, gates);
-            for (int i = 0; i < H; i++) {
-                const float ig = sigmoid(gates[i]);
-                const float fg = sigmoid(gates[H + i]);
-                const float gg = tanh_approx(gates[2 * H + i]);
-                const float og = sigmoid(gates[3 * H + i]);
-                c[i] = fg * c[i] + ig * gg;
-                h[i] = og * tanh_approx(c[i]);
-            }
-            for (int i = 0; i < H; i++) row(y, i)[t] = h[i];
+            ctx.xg = xg_t + (size_t) t * G;
+            ctx.t  = t;
+            zc_pool_run(pool, n_tasks, lstm_step, &ctx);
+            float * tmp = (float *) ctx.h_in; // h(t) is the next step's input
+            ctx.h_in  = ctx.h_out;
+            ctx.h_out = tmp;
         }
-        free(gates);
+        if (ctx.h_in != h) memcpy(h, ctx.h_in, (size_t) H * sizeof(float));
+        free(scratch);
+        free(xg_t);
         PROF_END(P_LSTM_REC);
     }
-    act_free(&xg);
 }
 
 // ---------------------------------------------------------------------------
@@ -402,16 +382,24 @@ static bool load_tensors(zencodec_model * m, FILE * f) {
         }
         if (m->n_tensors == MAX_TENSORS) return false;
 
-        t.data = malloc(t.numel * sizeof(float));
-        if (!t.data) return false;
+        const bool is_f32 = n_dims <= 1; // biases, including the 0-dim one of the last conv
+        const size_t elem = is_f32 ? sizeof(float) : sizeof(zc_weight);
+        void * dst = malloc(t.numel * elem);
+        if (!dst) return false;
+        if (is_f32) t.f = dst;
+        else        t.data = dst;
         m->tensors[m->n_tensors++] = t; // owned by the model from here on
-        if (ftype == 0) {
-            if (fread(t.data, 4, t.numel, f) != t.numel) return false;
-        } else {
-            uint16_t * h = malloc(nbytes);
-            const bool ok = h && fread(h, 2, t.numel, f) == t.numel;
-            if (ok) for (size_t i = 0; i < t.numel; i++) t.data[i] = fp16_to_fp32(h[i]);
-            free(h);
+        if (nbytes == t.numel * elem) { // stored as we keep it
+            if (fread(dst, 1, nbytes, f) != nbytes) return false;
+        } else { // f16 file into f32, or f32 file into f16 weights
+            void * raw = malloc(nbytes);
+            const bool ok = raw && fread(raw, 1, nbytes, f) == nbytes;
+            for (size_t i = 0; ok && i < t.numel; i++) {
+                const float v = ftype ? zc_h2f(((const uint16_t *) raw)[i]) : ((const float *) raw)[i];
+                if (is_f32) t.f[i] = v;
+                else        t.data[i] = zc_f2w(v);
+            }
+            free(raw);
             if (!ok) return false;
         }
     }
@@ -438,17 +426,32 @@ static const tensor * get(const zencodec_model * m, const char * name, size_t nu
 }
 
 // Hands a weight matrix to the backend. Takes ownership of `data`.
-static bool make_mat(zc_mat * mat, float * data, int taps, int M, int K) {
+static bool make_mat(zc_mat * mat, zc_weight * data, int taps, int M, int K) {
     *mat = (zc_mat) {M, K, taps, data, NULL};
     return data && zc_mat_prepare(mat);
 }
 
 // Takes a tensor's data out of the model (the matrices built from it replace it).
-static float * take(zencodec_model * m, const tensor * t) {
+static zc_weight * take(zencodec_model * m, const tensor * t) {
     tensor * mt = &m->tensors[t - m->tensors];
-    float * d = mt->data;
+    zc_weight * d = mt->data;
     mt->data = NULL;
     return d;
+}
+
+// Reorders the 4H gate rows of an LSTM weight matrix ([4H][K]) or bias (K = 1), of
+// `elem`-byte values, from PyTorch's gate-major order to the unit-block-major order of
+// lstm_layer.
+static void * lstm_reorder(const void * src, int H, int K, size_t elem) {
+    char * dst = src ? malloc((size_t) 4 * H * K * elem) : NULL;
+    if (!dst) return NULL;
+    const size_t row_bytes = (size_t) K * elem;
+    for (int g = 0; g < 4; g++)
+        for (int j = 0; j < H; j++) {
+            const int r = ((j / LSTM_U) * 4 + g) * LSTM_U + j % LSTM_U;
+            memcpy(dst + (size_t) r * row_bytes, (const char *) src + ((size_t) g * H + j) * row_bytes, row_bytes);
+        }
+    return dst;
 }
 
 // conv1d: weight [C_out][C_in][K] -> K taps of [C_out][C_in]
@@ -460,17 +463,17 @@ static bool bind_conv(zencodec_model * m, conv * cv, const char * prefix, int C_
     const tensor * w = get(m, name, (size_t) C_out * C_in * K);
     snprintf(name, sizeof(name), "%s.bias", prefix);
     cv->b = get(m, name, (size_t) C_out);
-    if (!w || !cv->b || w->n_dims != 3) return false;
+    if (!w || !cv->b || !cv->b->f || w->n_dims != 3) return false;
     cv->C_in = C_in, cv->C_out = C_out, cv->K = K;
 
-    float * src = take(m, w);
-    float * dst = malloc((size_t) C_out * C_in * K * sizeof(float));
+    zc_weight * src = take(m, w);
+    zc_weight * dst = malloc((size_t) C_out * C_in * K * sizeof(zc_weight));
     if (dst) {
         for (int co = 0; co < C_out; co++)
             for (int ci = 0; ci < C_in; ci++)
                 for (int k = 0; k < K; k++) {
-                    const float v = transpose ? src[((size_t) ci * C_out + co) * K + k]
-                                              : src[((size_t) co * C_in + ci) * K + k];
+                    const zc_weight v = transpose ? src[((size_t) ci * C_out + co) * K + k]
+                                                  : src[((size_t) co * C_in + ci) * K + k];
                     dst[((size_t) k * C_out + co) * C_in + ci] = v;
                 }
     }
@@ -486,7 +489,7 @@ static bool bind(zencodec_model * m) {
         snprintf(name, sizeof(name), "quantizer.vq.layers.%d._codebook.embed", i);
         const tensor * t = find(m, name);
         if (!t) break;
-        if (t->numel != (size_t) m->n_bins * H) return false;
+        if (t->numel != (size_t) m->n_bins * H || !t->data) return false;
         m->codebooks[m->n_codebooks++] = t;
     }
     if (m->n_codebooks == 0) {
@@ -497,6 +500,7 @@ static bool bind(zencodec_model * m) {
     int ch = 512; // n_filters * 2^4
     if (!bind_conv(m, &m->init_conv, "decoder.model.0.conv.conv", ch, H, 7, false)) return false;
 
+    if (ch % LSTM_U) return false;
     for (int l = 0; l < 2; l++) {
         lstm_layer * ll = &m->lstm[l];
         snprintf(name, sizeof(name), "decoder.model.1.lstm.weight_ih_l%d", l);
@@ -504,12 +508,23 @@ static bool bind(zencodec_model * m) {
         snprintf(name, sizeof(name), "decoder.model.1.lstm.weight_hh_l%d", l);
         const tensor * w_hh = get(m, name, (size_t) 4 * ch * ch);
         snprintf(name, sizeof(name), "decoder.model.1.lstm.bias_ih_l%d", l);
-        ll->b_ih = get(m, name, (size_t) 4 * ch);
+        const tensor * b_ih = get(m, name, (size_t) 4 * ch);
         snprintf(name, sizeof(name), "decoder.model.1.lstm.bias_hh_l%d", l);
-        ll->b_hh = get(m, name, (size_t) 4 * ch);
-        if (!w_ih || !w_hh || !ll->b_ih || !ll->b_hh) return false;
-        if (!make_mat(&ll->w_ih, take(m, w_ih), 1, 4 * ch, ch)) return false;
-        if (!make_mat(&ll->w_hh, take(m, w_hh), 1, 4 * ch, ch)) return false;
+        const tensor * b_hh = get(m, name, (size_t) 4 * ch);
+        if (!w_ih || !w_hh || !b_ih || !b_hh) return false;
+        float * bias = malloc((size_t) 4 * ch * sizeof(float));
+        if (!bias || !b_ih->f || !b_hh->f) { free(bias); return false; }
+        for (size_t i = 0; i < (size_t) 4 * ch; i++) bias[i] = b_ih->f[i] + b_hh->f[i];
+        ll->bias = lstm_reorder(bias, ch, 1, sizeof(float));
+        free(bias);
+        if (!ll->bias) return false;
+        zc_weight * w = take(m, w_ih);
+        const bool ok_ih = make_mat(&ll->w_ih, lstm_reorder(w, ch, ch, sizeof(zc_weight)), 1, 4 * ch, ch);
+        free(w);
+        w = take(m, w_hh);
+        const bool ok_hh = make_mat(&ll->w_hh, lstm_reorder(w, ch, ch, sizeof(zc_weight)), 1, 4 * ch, ch);
+        free(w);
+        if (!ok_ih || !ok_hh) return false;
     }
 
     for (int i = 0; i < 4; i++) {
@@ -575,6 +590,7 @@ void zencodec_free(zencodec_model * model) {
     for (int l = 0; l < 2; l++) {
         zc_mat_free(&model->lstm[l].w_ih);
         zc_mat_free(&model->lstm[l].w_hh);
+        free(model->lstm[l].bias);
     }
     for (int i = 0; i < 4; i++) {
         free_conv(&model->blocks[i].upsample);
@@ -582,7 +598,10 @@ void zencodec_free(zencodec_model * model) {
         free_conv(&model->blocks[i].conv2);
         free_conv(&model->blocks[i].shortcut);
     }
-    for (int i = 0; i < model->n_tensors; i++) free(model->tensors[i].data);
+    for (int i = 0; i < model->n_tensors; i++) {
+        free(model->tensors[i].data);
+        free(model->tensors[i].f);
+    }
     free(model);
 }
 
@@ -597,7 +616,8 @@ int zencodec_n_codebooks(const zencodec_model * model) { return model->n_codeboo
 
 struct zencodec_stream {
     const zencodec_model * m;
-    int n_q, n_threads;
+    int       n_q;
+    zc_pool * pool; // n_threads - 1 workers, reused by every layer (NULL: single-threaded)
 
     // state carried from one chunk to the next (see conv1d, conv_transpose1d)
     act     init_hist, block_hist[4], final_hist;
@@ -611,7 +631,7 @@ zencodec_stream * zencodec_stream_new(const zencodec_model * m, int n_q, int n_t
     if (!s) return NULL;
     s->m = m;
     s->n_q = n_q;
-    s->n_threads = n_threads < 1 ? 1 : n_threads;
+    s->pool = zc_pool_new(n_threads);
     s->lstm_state = calloc((size_t) 4 * m->init_conv.C_out, sizeof(float));
     for (int i = 0; i < 4; i++) {
         const conv * up = &m->blocks[i].upsample;
@@ -629,12 +649,14 @@ void zencodec_stream_free(zencodec_stream * s) {
         act_free(&s->block_tail[i]);
     }
     free(s->lstm_state);
+    zc_pool_free(s->pool);
     free(s);
 }
 
 int zencodec_stream_decode(zencodec_stream * s, const int32_t * codes, int n_frames, float * audio) {
     const zencodec_model * m = s->m;
-    const int H = m->hidden_dim, T = n_frames, n_threads = s->n_threads;
+    const int H = m->hidden_dim, T = n_frames;
+    zc_pool * pool = s->pool;
 
     if (T < 1) return 1;
     for (size_t i = 0; i < (size_t) s->n_q * T; i++) {
@@ -645,15 +667,15 @@ int zencodec_stream_decode(zencodec_stream * s, const int32_t * codes, int n_fra
     PROF_BEGIN();
     act x = act_new(H, T);
     for (int q = 0; q < s->n_q; q++) {
-        const float * embed = m->codebooks[q]->data;
+        const zc_weight * embed = m->codebooks[q]->data;
         for (int t = 0; t < T; t++) {
-            const float * e = embed + (size_t) codes[(size_t) q * T + t] * H;
-            for (int d = 0; d < H; d++) row(&x, d)[t] += e[d];
+            const zc_weight * e = embed + (size_t) codes[(size_t) q * T + t] * H;
+            for (int d = 0; d < H; d++) row(&x, d)[t] += zc_w2f(e[d]);
         }
     }
 
     PROF_END(P_RVQ);
-    act tmp = conv1d(&x, &m->init_conv, &s->init_hist, n_threads);
+    act tmp = conv1d(&x, &m->init_conv, &s->init_hist, pool);
     act_free(&x);
     x = tmp;
 
@@ -662,8 +684,8 @@ int zencodec_stream_decode(zencodec_stream * s, const int32_t * codes, int n_fra
         const int C = x.C;
         act y1 = act_new(C, T), y2 = act_new(C, T);
         float * st = s->lstm_state;
-        lstm_forward(&x,  &y1, &m->lstm[0], st,         st + C,     n_threads);
-        lstm_forward(&y1, &y2, &m->lstm[1], st + 2 * C, st + 3 * C, n_threads);
+        lstm_forward(&x,  &y1, &m->lstm[0], st,         st + C,     pool);
+        lstm_forward(&y1, &y2, &m->lstm[1], st + 2 * C, st + 3 * C, pool);
         for (size_t j = 0; j < (size_t) C * T; j++) x.d[j] += y2.d[j];
         act_free(&y1);
         act_free(&y2);
@@ -672,21 +694,21 @@ int zencodec_stream_decode(zencodec_stream * s, const int32_t * codes, int n_fra
     for (int i = 0; i < 4; i++) {
         const decoder_block * b = &m->blocks[i];
 
-        elu(&x, n_threads);
-        tmp = conv_transpose1d(&x, &b->upsample, &s->block_tail[i], RATIOS[i], n_threads);
+        elu(&x, pool);
+        tmp = conv_transpose1d(&x, &b->upsample, &s->block_tail[i], RATIOS[i], pool);
         act_free(&x);
         x = tmp;
 
         act y = act_new(x.C, x.T);
         memcpy(y.d, x.d, (size_t) x.C * x.T * sizeof(float));
-        elu(&y, n_threads);
-        tmp = conv1d(&y, &b->conv1, &s->block_hist[i], n_threads);
+        elu(&y, pool);
+        tmp = conv1d(&y, &b->conv1, &s->block_hist[i], pool);
         act_free(&y);
-        elu(&tmp, n_threads);
-        y = conv1d(&tmp, &b->conv2, NULL, n_threads);
+        elu(&tmp, pool);
+        y = conv1d(&tmp, &b->conv2, NULL, pool);
         act_free(&tmp);
 
-        tmp = conv1d(&x, &b->shortcut, NULL, n_threads);
+        tmp = conv1d(&x, &b->shortcut, NULL, pool);
         act_free(&x);
         x = tmp;
         {
@@ -697,8 +719,8 @@ int zencodec_stream_decode(zencodec_stream * s, const int32_t * codes, int n_fra
         act_free(&y);
     }
 
-    elu(&x, n_threads);
-    tmp = conv1d(&x, &m->final_conv, &s->final_hist, n_threads);
+    elu(&x, pool);
+    tmp = conv1d(&x, &m->final_conv, &s->final_hist, pool);
     act_free(&x);
 
     memcpy(audio, tmp.d, (size_t) tmp.T * sizeof(float));
