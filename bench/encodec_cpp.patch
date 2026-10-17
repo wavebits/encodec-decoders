@@ -1,0 +1,55 @@
+diff --git a/convert.py b/convert.py
+index 63c0ec6..5bb5c86 100644
+--- a/convert.py
++++ b/convert.py
+@@ -63,7 +63,7 @@ def parse_codec_model(checkpoint, outfile, use_f16):
+ 
+         if not "weight_v" in name:
+             # if conv kernel, do not squeeze because 3d tensor
+-            var_data = var_data.numpy().squeeze()
++            var_data = np.atleast_1d(var_data.numpy().squeeze())
+         else:
+             # weight_v has its corresponding magnitude tensor to rescale the weights
+             # of the convolutional layers. We parse both kinds of weights jointly to
+diff --git a/encodec.cpp b/encodec.cpp
+index 99ec3c3..bfad63d 100644
+--- a/encodec.cpp
++++ b/encodec.cpp
+@@ -33,7 +33,9 @@
+ #include "quantizer.h"
+ 
+ #define ENCODEC_FILE_MAGIC 'ggml'
++#ifndef ENCODEC_MAX_NODES
+ #define ENCODEC_MAX_NODES 80000
++#endif
+ 
+ typedef enum {
+     // Run the end-to-end encoder-decoder pipeline
+diff --git a/examples/decompress/main.cpp b/examples/decompress/main.cpp
+index 4fd29d4..3dcd69d 100644
+--- a/examples/decompress/main.cpp
++++ b/examples/decompress/main.cpp
+@@ -25,8 +25,7 @@ int main(int argc, char **argv) {
+         return 1;
+     }
+ 
+-    encodec_set_target_bandwidth(ectx, 12);
+-
++
+     // read compressed audio from disk
+     std::vector<int32_t> codes;
+     uint32_t audio_length, n_codebooks;
+@@ -34,6 +33,13 @@ int main(int argc, char **argv) {
+         printf("%s: error during reading codes\n", __func__);
+         return 1;
+     }
++    encodec_set_target_bandwidth(ectx, n_codebooks * 3 / 4);
++    { // .ecdc from the Python encodec CLI is [T][n_q]; encodec.cpp expects [n_q][T]
++        const size_t T = codes.size() / n_codebooks;
++        std::vector<int32_t> tr(codes.size());
++        for (size_t t = 0; t < T; t++) for (size_t q = 0; q < n_codebooks; q++) tr[q * T + t] = codes[t * n_codebooks + q];
++        codes.swap(tr);
++    }
+ 
+     // decompress audio
+     if (!encodec_decompress_audio(ectx, codes.data(), codes.size(), params.n_threads)) {
