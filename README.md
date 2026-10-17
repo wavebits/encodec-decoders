@@ -50,8 +50,7 @@ What works:
 - Playback in the CLI on macOS (AudioToolbox) and Linux (`aplay`). The library itself
   does no audio I/O.
 
-What is not done yet: the 48 kHz model, the language-model (`--lm`) entropy coder, and
-testing on phones. See the [roadmap](#roadmap).
+What is not done yet: testing on phones. See the [roadmap](#roadmap).
 
 ## Quick start
 
@@ -430,7 +429,16 @@ Upstream encodec.cpp needed four changes to decode these files correctly
   - int8 weights, which would quarter the weights' resident size.
 - **Size:** int8 weights, so the shipped asset is about 12 MB.
 - **Devices:** test on Android and iOS hardware, and add sample apps.
-- **Models:** the 48 kHz model, and the `--lm` entropy coder.
+
+Unsure future possibilities. These aren't needed for 24 kHz files encoded without `--lm`,
+and the decoder rejects such files today:
+
+- **`--hq` (the 48 kHz model):** stereo 48 kHz audio for music. It isn't causal, since
+  it decodes 1 s segments with an overlap, so it can't stream with low latency. It also
+  costs more compute and needs its own weights.
+- **`--lm` (the entropy coder):** a small Transformer language model plus arithmetic
+  coding, which makes files about 25–40% smaller. Decoding has to run the Transformer
+  every frame, which works against the speed and memory goals.
 
 ## Formats
 
