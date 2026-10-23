@@ -1,4 +1,4 @@
-"""Benchmark the FLMSBMP decoders against encodec.cpp and PyTorch, and record every metric.
+"""Benchmark the zencodec decoders against encodec.cpp and PyTorch, and record every metric.
 
 For each decoder, input file and thread count it measures:
   - wall time of the whole process, and the decode time the decoder reports itself
@@ -13,14 +13,14 @@ of them alike. Results go to:
   - bench/results/<date>_<commit>.md, with the machine description
   - bench/results/history.csv, one row per decoder/input/thread count, appended over time
 
-With --vocos, it also builds wb_decode-c with the Vocos decoder (-Dvocos=true) for each
+With --vocos, it also builds wb_decode with the Vocos decoder (-Dvocos=true) for each
 backend, runs it with the Vocos weights, and adds PyTorch Vocos, which is the accuracy
 reference for those rows.
 
 Usage:
     python bench/bench.py in.ecdc [more.ecdc ...] [-t 1,4] [-r 3]
         [--backends ref,neon,accelerate,neon+f16,ref+f16] [--baseline <git rev>]
-        [--vocos] [--no-zig] [--no-encodec-cpp] [--no-pytorch] [--no-accuracy] [--note "text"]
+        [--vocos] [--no-encodec-cpp] [--no-pytorch] [--no-accuracy] [--note "text"]
 
 Make inputs with `encodec -b 6 input.wav in.ecdc` (24 kHz model, no --lm).
 Needs zig. encodec.cpp needs git, cmake and a C++ compiler; PyTorch and the accuracy
@@ -115,26 +115,29 @@ def zig_flags(backend):
     return [f"-Dbackend={name}"] + (["-Df16=true"] if variant == "f16" else [])
 
 
-def build_flmsbmp(backends, vocos, zig=True):
-    """Builds wb_decode-c once per backend, plus wb_decode-zig, and with `vocos` once more
-    per backend with the Vocos decoder. Returns decoder specs."""
+def cli_exe(prefix):
+    """The CLI in a build prefix; it was named wb_decode-c, and before that zencodec-c."""
+    return next(p for p in (prefix / "bin").iterdir() if p.name in ("wb_decode", "wb_decode-c", "zencodec-c"))
+
+
+def build_zencodec(backends, vocos):
+    """Builds wb_decode once per backend, and with `vocos` once more per backend with the
+    Vocos decoder. Returns decoder specs."""
     decoders = []
-    for i, backend in enumerate(backends):
+    for backend in backends:
         prefix = WORK / f"build-{backend}"
         run(["zig", "build", *zig_flags(backend), "-Dstrip=true", "-p", str(prefix)], cwd=ROOT)
-        decoders.append(cli_decoder(f"wb_decode-c ({backend})", prefix / "bin" / "wb_decode-c", backend))
-        if i == 0 and zig:
-            decoders.append(cli_decoder("wb_decode-zig", prefix / "bin" / "wb_decode-zig", "zig"))
+        decoders.append(cli_decoder(f"wb_decode ({backend})", cli_exe(prefix), backend))
     for backend in backends if vocos else []:
         prefix = WORK / f"build-{backend}-vocos"
         run(["zig", "build", *zig_flags(backend), "-Dvocos=true", "-Dstrip=true", "-p", str(prefix)], cwd=ROOT)
-        decoders.append(cli_decoder(f"wb_decode-c vocos ({backend})", prefix / "bin" / "wb_decode-c",
+        decoders.append(cli_decoder(f"wb_decode vocos ({backend})", cli_exe(prefix),
                                     f"{backend}+vocos", VOCOS_WEIGHTS, "vocos"))
     return decoders
 
 
 def build_baseline(rev, backends):
-    """Builds wb_decode-c from an earlier git revision, once per backend if that revision
+    """Builds wb_decode from an earlier git revision, once per backend if that revision
     has backends, for before/after comparisons. Returns decoder specs."""
     sha = sh(f"git -C {ROOT} rev-parse --short {rev}")
     if not sha:
@@ -146,8 +149,7 @@ def build_baseline(rev, backends):
         run(["tar", "-x", "-C", str(tree)], input=archive)
     if "backend" not in (tree / "build.zig").read_text():  # before the backends existed
         run(["zig", "build", "-Dstrip=true"], cwd=tree)
-        exe = next(p for p in (tree / "zig-out" / "bin").iterdir() if p.name in ("wb_decode-c", "zencodec-c"))
-        return [cli_decoder(f"wb_decode-c @{sha}", exe, f"@{sha}")]
+        return [cli_decoder(f"wb_decode @{sha}", cli_exe(tree / "zig-out"), f"@{sha}")]
     decoders = []
     has_f16 = '"f16"' in (tree / "build.zig").read_text()
     for backend in backends:
@@ -155,7 +157,7 @@ def build_baseline(rev, backends):
             continue
         prefix = tree / f"build-{backend}"
         run(["zig", "build", *zig_flags(backend), "-Dstrip=true", "-p", str(prefix)], cwd=tree)
-        decoders.append(cli_decoder(f"wb_decode-c ({backend}) @{sha}", prefix / "bin" / "wb_decode-c", f"{backend}@{sha}"))
+        decoders.append(cli_decoder(f"wb_decode ({backend}) @{sha}", cli_exe(prefix), f"{backend}@{sha}"))
     return decoders
 
 
@@ -299,9 +301,8 @@ def main():
     ap.add_argument("-t", "--threads", default="4", help="comma-separated thread counts (default 4)")
     ap.add_argument("-r", "--runs", type=int, default=3)
     ap.add_argument("--backends", default=None, help="comma-separated C backends (default: all for this machine)")
-    ap.add_argument("--baseline", default=None, help="also build wb_decode-c from this git revision")
+    ap.add_argument("--baseline", default=None, help="also build wb_decode from this git revision")
     ap.add_argument("--vocos", action="store_true", help="also benchmark the Vocos decoder and PyTorch Vocos")
-    ap.add_argument("--no-zig", action="store_true")
     ap.add_argument("--no-encodec-cpp", action="store_true")
     ap.add_argument("--no-pytorch", action="store_true")
     ap.add_argument("--no-accuracy", action="store_true",
@@ -318,7 +319,7 @@ def main():
 
     print("building ...", file=sys.stderr)
     backends = args.backends.split(",") if args.backends else default_backends()
-    decoders = build_flmsbmp(backends, args.vocos, not args.no_zig)
+    decoders = build_zencodec(backends, args.vocos)
     if args.baseline:  # each baseline build goes right after the current build of its backend
         for base in build_baseline(args.baseline, backends):
             after = next((i for i, d in enumerate(decoders) if base["backend"].startswith(d["backend"] + "@")),

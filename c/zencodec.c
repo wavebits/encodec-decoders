@@ -1,4 +1,5 @@
-// zencodec: minimal, dependency-free EnCodec (24 kHz) decoder in C17.
+// zencodec: the EnCodec (24 kHz) decoder, and the public API (zencodec.h), which
+// hands Vocos weights files to vocos.c.
 //
 // Architecture (SEANet decoder, causal, reflect padding), activations are [C][T]:
 //   RVQ decode            sum of n_q codebook embeddings          -> [128][T]
@@ -759,10 +760,6 @@ int zencodec_stream_decode(zencodec_stream * s, const int32_t * codes, int n_fra
 int zencodec_decode(const zencodec_model * m, const int32_t * codes, int n_q, int n_frames,
                     float * audio, int n_threads) {
     if (!valid_n_q(m, n_q) || n_frames < 1) return 1;
-    for (size_t i = 0; i < (size_t) n_q * n_frames; i++) {
-        if (codes[i] < 0 || codes[i] >= n_bins(m)) return 2;
-    }
-
     zencodec_stream * s = zencodec_stream_new(m, n_q, n_threads);
     int32_t * chunk = malloc((size_t) n_q * ZENCODEC_CHUNK_FRAMES * sizeof(int32_t));
     int ret = s && chunk ? 0 : 3;
@@ -772,7 +769,7 @@ int zencodec_decode(const zencodec_model * m, const int32_t * codes, int n_q, in
         for (int q = 0; q < n_q; q++)
             memcpy(chunk + (size_t) q * n, codes + (size_t) q * n_frames + f, (size_t) n * sizeof(int32_t));
         const int w = zencodec_stream_push(s, chunk, n, audio + done);
-        if (w < 0) ret = 3;
+        if (w < 0) ret = w == -2 ? 2 : 3;
         else       done += (size_t) w;
     }
     if (ret == 0) {

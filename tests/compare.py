@@ -1,9 +1,9 @@
-"""Compare a zencodec CLI (C or Zig) against the reference PyTorch EnCodec decoder, or,
+"""Compare the wb_decode CLI against the reference PyTorch EnCodec decoder, or,
 with --vocos, the C Vocos decoder against the reference PyTorch Vocos.
 
 Usage:
-    python tests/compare.py zig-out/bin/wb_decode-c weights/encodec_24khz_decoder_f16.bin
-    python tests/compare.py zig-out/bin/wb_decode-c weights/vocos_encodec_24khz_f16.bin --vocos
+    python tests/compare.py zig-out/bin/wb_decode weights/encodec_24khz_decoder_f16.bin
+    python tests/compare.py zig-out/bin/wb_decode weights/vocos_encodec_24khz_f16.bin --vocos
         (needs a build with -Dvocos=true, and pip install vocos)
 """
 import argparse

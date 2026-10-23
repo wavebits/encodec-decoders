@@ -8,12 +8,6 @@
 #include <string.h>
 #include <time.h>
 
-int play_audio(const float * samples, size_t n, int sample_rate) {
-    atomic_size_t ready = n;
-    atomic_bool   done  = true;
-    return play_audio_stream(samples, &ready, &done, sample_rate);
-}
-
 #if defined(__APPLE__)
 
 #include <AudioToolbox/AudioToolbox.h>

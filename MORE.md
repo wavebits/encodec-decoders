@@ -1,4 +1,4 @@
-# FLMSBMP — details
+# zencodec — details
 
 The [README](README.md) gives the overview and the main numbers. This file has the rest:
 build options, backends, embedding, the Vocos decoder, the API, accuracy, every
@@ -13,9 +13,9 @@ What works:
 - Batch and **streaming** decoding: audio comes out in 1 s chunks, and playback starts
   after about 0.1 s.
 - Optionally, the **[Vocos](#vocos-decoder-optional)** decoder for the same codes, at 1.5
-  to 12 kbps (C version only).
-- CPU only, with three C backends: portable C, hand-written NEON kernels, or Apple's
-  Accelerate. The Zig version uses `@Vector` SIMD.
+  to 12 kbps.
+- CPU only, with four backends: portable C, hand-written NEON kernels, Apple's
+  Accelerate, or any CBLAS such as OpenBLAS.
 - Playback in the CLI on macOS (AudioToolbox) and Linux (`aplay`). The library itself
   does no audio I/O.
 
@@ -24,34 +24,34 @@ What is not done yet: testing on phones. See the [roadmap](#roadmap).
 ## Quick start
 
 ```bash
-zig build -Dstrip=true                       # builds zig-out/bin/wb_decode-c and wb_decode-zig
+zig build -Dstrip=true                       # builds zig-out/bin/wb_decode
 pip install torch numpy encodec torchaudio   # for the weights and for encoding
 python scripts/convert.py --use-f16          # downloads Meta's checkpoint → weights/encodec_24khz_decoder_f16.bin
 encodec -b 6 input.wav input.ecdc            # compress a WAV with Meta's reference CLI
-zig-out/bin/wb_decode-c play   weights/encodec_24khz_decoder_f16.bin input.ecdc
-zig-out/bin/wb_decode-c decode weights/encodec_24khz_decoder_f16.bin input.ecdc out.wav -t 4
+zig-out/bin/wb_decode play   weights/encodec_24khz_decoder_f16.bin input.ecdc
+zig-out/bin/wb_decode decode weights/encodec_24khz_decoder_f16.bin input.ecdc out.wav -t 4
 
 zig build -Dvocos=true -Dstrip=true         # optional: with the Vocos decoder
 python scripts/convert_vocos.py --use-f16    # → weights/vocos_encodec_24khz_f16.bin
-zig-out/bin/wb_decode-c decode weights/vocos_encodec_24khz_f16.bin input.ecdc out.wav -t 4
+zig-out/bin/wb_decode decode weights/vocos_encodec_24khz_f16.bin input.ecdc out.wav -t 4
 ```
 
 ## Build
 
-With [Zig](https://ziglang.org) 0.17, which builds both versions (the default optimize
-mode is `fast`):
+With [Zig](https://ziglang.org) 0.17 as the build tool and C compiler (the default
+optimize mode is `fast`), or with any C17 compiler (see below):
 
 ```bash
 zig build                                    # native, best backend for the target
 zig build -Dstrip=true                       # drop debug info (smallest binaries)
-zig build -Dbackend=neon                     # pick the C compute backend (see below)
+zig build -Dbackend=neon                     # pick the compute backend (see below)
 zig build -Dtarget=aarch64-linux-musl        # cross-compile, e.g. for an ARM64 Linux board
 zig build -Dprofile=true                     # print time per decoder stage when done
 zig build -Df16=true                         # keep weights in f16 in memory: ~23 MB less (see below)
-zig build -Dvocos=true                       # include the Vocos decoder (C version, see below)
+zig build -Dvocos=true                       # include the Vocos decoder (see below)
 ```
 
-### C compute backends
+### Compute backends
 
 All the heavy layers are matrix products, which go through one small interface
 (`c/backend.h`). One backend is compiled in:
@@ -68,9 +68,9 @@ AArch64 targets and `ref` elsewhere. `blas` is never picked automatically by
 `zig build`; use `-Dbackend=blas` (and `-Dblas-lib=` for a library other than OpenBLAS).
 OpenBLAS has tuned AVX2/AVX-512 kernels, while `ref` relies on the compiler, so on x86-64
 Linux `blas` is the backend to use. On an M1 (Vocos, 30 s, 1 thread) it took 0.61 s,
-against 0.67 s for `neon` and 1.83 s for `ref`, with the same output as `ref`. The C decoder keeps the thread count: it sets OpenBLAS,
-and OpenMP builds of it, to 1 thread on each thread that calls it, and splits the work
-itself. On Apple, Homebrew's OpenBLAS uses OpenMP, so build with
+against 0.67 s for `neon` and 1.83 s for `ref`, with the same output as `ref`. The
+decoder keeps control of the thread count: it sets OpenBLAS, and OpenMP builds of it, to
+1 thread on each thread that calls it, and splits the work itself. On Apple, Homebrew's OpenBLAS uses OpenMP, so build with
 `-DZENCODEC_BLAS_OMP -Wl,-U,_omp_set_num_threads` or set `OMP_NUM_THREADS=1`. The CLI
 prints the backend it was built with.
 
@@ -107,38 +107,40 @@ f32. Biases stay in f32, because they are tiny.
   `-Dcpu=x86_64_v3`). Elsewhere a portable bit-manipulation fallback is used, which is
   slower.
 
-For the C version on its own, any C17 compiler works. Add the backend's define:
+Without Zig, any C17 compiler works. Add the backend's define:
 
 ```bash
-cc -std=c17 -O3 c/*.c -lm -lpthread -framework AudioToolbox -o wb_decode-c                    # ref, macOS
-cc -std=c17 -O3 -DZENCODEC_BACKEND_NEON c/*.c -lm -lpthread -o wb_decode-c                     # neon, Linux
+cc -std=c17 -O3 c/*.c -lm -lpthread -framework AudioToolbox -o wb_decode                      # ref, macOS
+cc -std=c17 -O3 -DZENCODEC_BACKEND_NEON c/*.c -lm -lpthread -o wb_decode                       # neon, Linux
 cc -std=c17 -O3 -DZENCODEC_BACKEND_ACCELERATE -DACCELERATE_NEW_LAPACK c/*.c -lm -lpthread \
-   -framework AudioToolbox -framework Accelerate -o wb_decode-c                                 # accelerate, macOS
-cc -std=c17 -O3 -DZENCODEC_BACKEND_BLAS c/*.c -lopenblas -lm -lpthread -o wb_decode-c           # blas, Linux
-cc -std=c17 -O3 -DZENCODEC_BACKEND_NEON -DZENCODEC_F16_WEIGHTS c/*.c -lm -lpthread -o wb_decode-c  # neon + f16, Linux
+   -framework AudioToolbox -framework Accelerate -o wb_decode                                   # accelerate, macOS
+cc -std=c17 -O3 -DZENCODEC_BACKEND_BLAS c/*.c -lopenblas -lm -lpthread -o wb_decode             # blas, Linux
+cc -std=c17 -O3 -DZENCODEC_BACKEND_NEON -DZENCODEC_F16_WEIGHTS c/*.c -lm -lpthread -o wb_decode    # neon + f16, Linux
 ```
 
 Stripped sizes:
 
-| Target | wb_decode-c | wb_decode-zig |
-| --- | --- | --- |
-| aarch64-macos (accelerate) | 72 KB | 323 KB |
-| aarch64-linux-musl (neon, static, libc included) | 79 KB | 330 KB |
-| x86_64-linux-gnu (ref, dynamic) | 35 KB | 366 KB |
-| aarch64-linux-android | use the NDK's clang | 333 KB |
+| Target | wb_decode |
+| --- | --- |
+| aarch64-macos (accelerate) | 72 KB |
+| aarch64-linux-musl (neon, static, libc included) | 79 KB |
+| x86_64-linux-gnu (ref, dynamic) | 35 KB |
+
+These are without Vocos, which adds 17–27 KB.
 
 ### Embedding on phones and devices
 
 To embed the decoder, add `c/zencodec.{h,c}`, `c/internal.h`, `c/pool.{h,c}`, `c/backend.h`,
-`c/backend_ref.c` (plus `c/vocos.c` and `-DZENCODEC_VOCOS` for Vocos) and the backend file you want (`backend_neon.c`, `backend_accelerate.c` or `backend_blas.c`) to your project, and
-define its `ZENCODEC_BACKEND_*` macro. They need only libc, libm and pthreads (plus
-Accelerate or a CBLAS for those backends). Leave out `c/play.c` and `c/main.c`, which are the CLI.
+`c/backend_ref.c` (plus `c/vocos.c` and `-DZENCODEC_VOCOS` for Vocos) and the backend
+file you want (`backend_neon.c`, `backend_accelerate.c` or `backend_blas.c`) to your
+project, and define its `ZENCODEC_BACKEND_*` macro. They need only libc, libm and
+pthreads (plus Accelerate or a CBLAS for those backends). Leave out `c/play.c` and
+`c/main.c`, which are the CLI.
 
 - **iOS / macOS:** add the files to an Xcode target. They can be called from Swift through
   a bridging header.
 - **Android:** build with the NDK's clang (CMake or `ndk-build`) and call through JNI.
-  Zig cannot cross-compile the C version for Android, because it does not ship Bionic
-  libc. The Zig version cross-compiles with `zig build -Dtarget=aarch64-linux-android`.
+  `zig build` cannot target Android, because Zig does not ship Bionic libc.
 - **Linux boards:** `zig build -Dtarget=aarch64-linux-musl -Dstrip=true` gives static
   binaries.
 
@@ -171,7 +173,7 @@ and the implementation.
 ```bash
 zig build -Dvocos=true                       # or compile c/vocos.c with -DZENCODEC_VOCOS
 python scripts/convert_vocos.py --use-f16    # → weights/vocos_encodec_24khz_f16.bin (20 MB)
-zig-out/bin/wb_decode-c decode weights/vocos_encodec_24khz_f16.bin in.ecdc out.wav
+zig-out/bin/wb_decode decode weights/vocos_encodec_24khz_f16.bin in.ecdc out.wav
 ```
 
 The weights file selects the decoder, so the same binary and API decode with either one.
@@ -184,7 +186,7 @@ The weights file selects the decoder, so the same binary and API decode with eit
 - **Accuracy:** against PyTorch Vocos (`tests/compare.py --vocos`), 83–94 dB SNR with f32
   weights, which is the limit of 16-bit output, and 42–55 dB with f16 weights.
 - **Cost:** 17–27 KB more binary, depending on the target. Works with every backend and
-  with `-Df16=true`. C version only.
+  with `-Df16=true`.
 
 30 s of speech cut from the 10-minute file below (6 kbps), Apple M1, median of 5
 interleaved runs, load average 6.6–8 (times are about 1.4× those of a quiet machine). The
@@ -194,12 +196,12 @@ different audio, so they can't be scored against each other. Full table, with mu
 
 | Decoder | Wall, 1 thread | Decode, 1 thread | Decode, 4 threads | Peak memory | Size | SNR (worst 1 s) |
 | --- | --- | --- | --- | --- | --- | --- |
-| wb_decode-c EnCodec (accelerate) | 0.97 s | 0.91 s | 0.89 s | 77 MB | 73 KB | 60.6 dB (49.3) |
-| wb_decode-c **Vocos** (accelerate) | **0.30 s** | **0.26 s** | 0.34 s | **52 MB** | 90 KB | 56.8 dB (50.6) |
-| wb_decode-c EnCodec (neon) | 3.01 s | 2.93 s | 1.89 s | 82 MB | 89 KB | 60.6 dB (49.2) |
-| wb_decode-c **Vocos** (neon) | 1.00 s | 0.96 s | 0.61 s | 52 MB | 106 KB | 56.8 dB (50.7) |
-| wb_decode-c EnCodec (ref) | 7.58 s | 7.50 s | 4.97 s | 78 MB | 72 KB | 60.6 dB (49.2) |
-| wb_decode-c **Vocos** (ref) | 3.05 s | 3.01 s | 2.85 s | 52 MB | 90 KB | 56.8 dB (50.6) |
+| wb_decode EnCodec (accelerate) | 0.97 s | 0.91 s | 0.89 s | 77 MB | 73 KB | 60.6 dB (49.3) |
+| wb_decode **Vocos** (accelerate) | **0.30 s** | **0.26 s** | 0.34 s | **52 MB** | 90 KB | 56.8 dB (50.6) |
+| wb_decode EnCodec (neon) | 3.01 s | 2.93 s | 1.89 s | 82 MB | 89 KB | 60.6 dB (49.2) |
+| wb_decode **Vocos** (neon) | 1.00 s | 0.96 s | 0.61 s | 52 MB | 106 KB | 56.8 dB (50.7) |
+| wb_decode EnCodec (ref) | 7.58 s | 7.50 s | 4.97 s | 78 MB | 72 KB | 60.6 dB (49.2) |
+| wb_decode **Vocos** (ref) | 3.05 s | 3.01 s | 2.85 s | 52 MB | 90 KB | 56.8 dB (50.6) |
 | encodec.cpp | 9.35 s | 9.29 s | 9.02 s | 1.09 GB | 1.0 MB | 53.7 dB (51.8) |
 | PyTorch `encodec` | 5.00 s | 3.07 s | 2.41 s | 2.17 GB | 518 MB + Python | reference |
 | PyTorch `vocos` | 2.29 s | 0.19 s | 0.20 s | 501 MB | 522 MB + Python | reference |
@@ -225,10 +227,10 @@ interleaved runs, load average 5.8–8.6. Full table:
 
 | Decoder | Wall, 1 thread | Wall, 4 threads | Peak memory |
 | --- | --- | --- | --- |
-| wb_decode-c EnCodec (accelerate) | 16.7 s (13.6–38.3) | 29.9 s (21.1–33.3) | 137 MB |
-| wb_decode-c **Vocos** (accelerate) | **6.6 s** (5.5–15.0) | 7.5 s (6.0–10.7) | **109 MB** |
-| wb_decode-c EnCodec (neon) | 54.0 s (44.9–106.3) | 44.6 s (33.4–53.7) | 138 MB |
-| wb_decode-c **Vocos** (neon) | 29.4 s (19.9–35.0) | 20.6 s (12.7–20.7) | 109 MB |
+| wb_decode EnCodec (accelerate) | 16.7 s (13.6–38.3) | 29.9 s (21.1–33.3) | 137 MB |
+| wb_decode **Vocos** (accelerate) | **6.6 s** (5.5–15.0) | 7.5 s (6.0–10.7) | **109 MB** |
+| wb_decode EnCodec (neon) | 54.0 s (44.9–106.3) | 44.6 s (33.4–53.7) | 138 MB |
+| wb_decode **Vocos** (neon) | 29.4 s (19.9–35.0) | 20.6 s (12.7–20.7) | 109 MB |
 | PyTorch `vocos` | | 12.3–15.9 s (decode 6.9–9.0 s) | 2.25–2.53 GB |
 
 - **Speed:** Vocos is 2.5× faster than EnCodec on accelerate (92× real time), and 1.8–2.2×
@@ -246,11 +248,10 @@ interleaved runs, load average 5.8–8.6. Full table:
 
 ## Usage
 
-Both CLIs take the same commands:
 
 ```bash
-wb_decode-c decode <weights.bin> <codes.bin|in.ecdc> <out.wav> [-t n_threads]
-wb_decode-c play   <weights.bin> <codes.bin|in.ecdc>           [-t n_threads]
+wb_decode decode <weights.bin> <codes.bin|in.ecdc> <out.wav> [-t n_threads]
+wb_decode play   <weights.bin> <codes.bin|in.ecdc>           [-t n_threads]
 ```
 
 The input can be:
@@ -263,11 +264,6 @@ The input can be:
 chunk, so playback does not wait for the whole file.
 
 ## Library API
-
-The library keeps the `zencodec_` prefix (C) and `zencodec` module name (Zig) for its
-identifiers.
-
-C:
 
 ```c
 zencodec_model * m = zencodec_load("weights/encodec_24khz_decoder_f16.bin");
@@ -289,20 +285,7 @@ zencodec_free(m);
 pushes write less, and `zencodec_stream_flush` writes the rest. `zencodec_stream_decode`
 (returns 0 and always writes a full chunk) is still there for EnCodec.
 
-Zig:
-
-```zig
-var model = try zencodec.Model.load(gpa, io, "weights/encodec_24khz_decoder_f16.bin");
-defer model.deinit();
-const audio = try gpa.alloc(f32, n_frames * zencodec.hop_length);
-try model.decode(codes, n_q, n_frames, audio, n_threads);
-
-var stream = try zencodec.Stream.init(&model, n_q, n_threads); // chunk by chunk
-defer stream.deinit();
-try stream.decode(chunk_codes, chunk_frames, chunk_audio);
-```
-
-Both EnCodec implementations are causal. Between chunks, the stream carries each layer's state: the
+The EnCodec decoder is causal. Between chunks, the stream carries each layer's state: the
 LSTM state, the last `K - 1` inputs of each conv, and the overlap of each transposed
 conv. So nothing is recomputed. `decode` uses a stream internally, so memory does not
 depend on the length of the input.
@@ -320,7 +303,7 @@ codes [n_q][T]
 
 There is no graph and no tensor library. Each layer is written as matrix products over
 `[C][T]` buffers, which the compiled-in backend runs (see
-[C compute backends](#c-compute-backends)). Weights are stored in f16 and converted to
+[compute backends](#compute-backends)). Weights are stored in f16 and converted to
 f32 on load, or kept in f16 with `-Df16=true`.
 
 All layers run on one persistent thread pool per stream, whose fork-join costs about a
@@ -334,11 +317,10 @@ which function implements what.
 ## Accuracy
 
 ```bash
-python tests/compare.py zig-out/bin/wb_decode-c   weights/encodec_24khz_decoder_f16.bin
-python tests/compare.py zig-out/bin/wb_decode-zig weights/encodec_24khz_decoder_f16.bin
+python tests/compare.py zig-out/bin/wb_decode weights/encodec_24khz_decoder_f16.bin
 ```
 
-Against the PyTorch decoder, both versions give an SNR of 55–63 dB with the f16 weights
+Against the PyTorch decoder, it gives an SNR of 55–63 dB with the f16 weights
 and about 80–100 dB with the f32 weights.
 
 f16 rounding is not spread evenly. In one 30 s music clip, one second drops to about
@@ -348,7 +330,7 @@ the f32 weights, every second stays at about 80 dB.
 Vocos, against PyTorch Vocos:
 
 ```bash
-python tests/compare.py zig-out/bin/wb_decode-c weights/vocos_encodec_24khz_f16.bin --vocos   # needs -Dvocos=true
+python tests/compare.py zig-out/bin/wb_decode weights/vocos_encodec_24khz_f16.bin --vocos   # needs -Dvocos=true
 ```
 
 - Test cases (0.01 to 5 s, 1.5 to 12 kbps): 83–94 dB with f32 weights, 42–55 dB with f16,
@@ -368,9 +350,8 @@ python bench/bench.py in.ecdc [more.ecdc ...] -t 1,4 -r 3 [--baseline <git rev>]
 
 `bench/bench.py`:
 
-1. Builds `wb_decode-c` once per C backend, including the f16-weights builds (`neon+f16`,
-   `ref+f16`), plus `wb_decode-zig`. With `--baseline`, it
-   also builds `wb_decode-c` from an earlier commit, once per backend, for before/after
+1. Builds `wb_decode` once per backend, including the f16-weights builds (`neon+f16`,
+   `ref+f16`). With `--baseline`, it also builds `wb_decode` from an earlier commit, once per backend, for before/after
    comparisons.
 2. Clones encodec.cpp at a pinned commit into `bench/work/`, applies
    `bench/encodec_cpp.patch` (see below) and builds it.
@@ -409,16 +390,15 @@ alone, without process startup or model loading.
 
 | Decoder | Threads | Wall | Decode | × real time | CPU (user) | Peak memory | SNR | Worst 1 s |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| wb_decode-c (accelerate) | 1 | 0.58 s | 0.54 s | 55.5× | 0.57 s | 77 MB | 27.3 dB | 13.7 dB |
-| wb_decode-c (accelerate) | 4 | **0.45 s** | **0.41 s** | **73.9×** | 0.96 s | 77 MB | 27.3 dB | 13.7 dB |
-| wb_decode-c (accelerate) before the pool | 4 | 0.52 s | 0.48 s | 63.0× | 0.60 s | 77 MB | 27.3 dB | 13.7 dB |
-| wb_decode-c (neon) | 1 | 1.72 s | 1.67 s | 17.9× | 1.70 s | 79 MB | 27.3 dB | 13.7 dB |
-| wb_decode-c (neon) | 4 | 0.68 s | 0.62 s | 48.0× | 2.39 s | 81 MB | 27.3 dB | 13.7 dB |
-| wb_decode-c (neon) before the pool | 4 | 0.87 s | 0.82 s | 36.6× | 1.96 s | 78 MB | 27.3 dB | 13.7 dB |
-| wb_decode-c (ref) | 1 | 4.40 s | 4.35 s | 6.9× | 4.37 s | 77 MB | 27.3 dB | 13.7 dB |
-| wb_decode-c (ref) | 4 | 1.86 s | 1.81 s | 16.6× | 7.12 s | 80 MB | 27.3 dB | 13.7 dB |
-| wb_decode-c (ref) before the pool | 4 | 2.21 s | 2.17 s | 13.8× | 6.43 s | 77 MB | 27.3 dB | 13.7 dB |
-| wb_decode-zig | 4 | 2.85 s | 2.84 s | 10.6× | 6.94 s | 90 MB | 27.3 dB | 13.7 dB |
+| wb_decode (accelerate) | 1 | 0.58 s | 0.54 s | 55.5× | 0.57 s | 77 MB | 27.3 dB | 13.7 dB |
+| wb_decode (accelerate) | 4 | **0.45 s** | **0.41 s** | **73.9×** | 0.96 s | 77 MB | 27.3 dB | 13.7 dB |
+| wb_decode (accelerate) before the pool | 4 | 0.52 s | 0.48 s | 63.0× | 0.60 s | 77 MB | 27.3 dB | 13.7 dB |
+| wb_decode (neon) | 1 | 1.72 s | 1.67 s | 17.9× | 1.70 s | 79 MB | 27.3 dB | 13.7 dB |
+| wb_decode (neon) | 4 | 0.68 s | 0.62 s | 48.0× | 2.39 s | 81 MB | 27.3 dB | 13.7 dB |
+| wb_decode (neon) before the pool | 4 | 0.87 s | 0.82 s | 36.6× | 1.96 s | 78 MB | 27.3 dB | 13.7 dB |
+| wb_decode (ref) | 1 | 4.40 s | 4.35 s | 6.9× | 4.37 s | 77 MB | 27.3 dB | 13.7 dB |
+| wb_decode (ref) | 4 | 1.86 s | 1.81 s | 16.6× | 7.12 s | 80 MB | 27.3 dB | 13.7 dB |
+| wb_decode (ref) before the pool | 4 | 2.21 s | 2.17 s | 13.8× | 6.43 s | 77 MB | 27.3 dB | 13.7 dB |
 | encodec.cpp | 4 | 2.97 s | 2.94 s | 10.2× | 11.51 s | 1.09 GB | 46.2 dB | 34.7 dB |
 | PyTorch `encodec` | 1 | 2.36 s | 1.43 s | 21.0× | 2.00 s | 2.17 GB | reference | reference |
 | PyTorch `encodec` | 4 | 1.79 s | 0.85 s | 35.2× | 2.21 s | 2.17 GB | reference | reference |
@@ -440,7 +420,6 @@ alone, without process startup or model loading.
   - Its wall time includes about 1 s of Python and PyTorch startup.
   - Its install is 518 MB of PyTorch, plus a Python runtime.
   - Its memory grows with the length of the audio: 953 MB for 10 s and 2.17 GB for 30 s.
-- **wb_decode-zig** doesn't have the backends or the thread pool yet.
 
 The earlier results, at commit `617db75` under heavier load, are in
 [bench/results/2026-10-17T1438_617db75.md](bench/results/2026-10-17T1438_617db75.md).
@@ -452,18 +431,17 @@ average 4–16).
 
 **Wall time** (lower is better):
 
-| Case | wb_decode-c | wb_decode-zig | encodec.cpp |
-| --- | --- | --- | --- |
-| 10 s audio, 1 thread\* | 1.67–2.04 s | 1.80–2.29 s | 1.94–2.20 s |
-| 10 s audio, 4 threads | 2.3–2.9 s | 3.0–3.2 s | 2.6–3.3 s |
-| 30 s audio, 4 threads | 8.1–9.3 s | 8.7–9.7 s | 13.6–15.4 s |
-| 30 s audio, 8 threads | 6.5–6.6 s | 9.2–10.1 s | 37–175 s |
+| Case | wb_decode | encodec.cpp |
+| --- | --- | --- |
+| 10 s audio, 1 thread\* | 1.67–2.04 s | 1.94–2.20 s |
+| 10 s audio, 4 threads | 2.3–2.9 s | 2.6–3.3 s |
+| 30 s audio, 4 threads | 8.1–9.3 s | 13.6–15.4 s |
+| 30 s audio, 8 threads | 6.5–6.6 s | 37–175 s |
 
 \* Measured in a separate session at lower load (load average about 2.6), so compare
 this row only within itself.
 
-- **1 thread:** wb_decode-c is about 10–15% faster than encodec.cpp, and wb_decode-zig is
-  in between.
+- **1 thread:** wb_decode is about 10–15% faster than encodec.cpp.
 - **4 threads:** encodec.cpp uses about twice the CPU time.
 - **8 threads:** encodec.cpp slows down sharply. Its graph has one node per LSTM step and
   frame, and its threads synchronize at every node.
@@ -472,12 +450,12 @@ this row only within itself.
 
 **Peak memory** (`/usr/bin/time -l`, peak footprint):
 
-| Audio length | wb_decode-c | wb_decode-zig | encodec.cpp | PyTorch `encodec` |
-| --- | --- | --- | --- | --- |
-| 10 s | 71 MB | 92 MB | 377 MB | 953 MB |
-| 30 s | 72 MB | 93 MB | 1.09 GB | 2.17 GB |
+| Audio length | wb_decode | encodec.cpp | PyTorch `encodec` |
+| --- | --- | --- | --- |
+| 10 s | 71 MB | 377 MB | 953 MB |
+| 30 s | 72 MB | 1.09 GB | 2.17 GB |
 
-FLMSBMP decodes in fixed-size chunks, so its memory does not change with the length of
+zencodec decodes in fixed-size chunks, so its memory does not change with the length of
 the audio. encodec.cpp and PyTorch process the whole file at once, so their memory grows
 with the length of the audio. The PyTorch figures are from the session above.
 
@@ -485,8 +463,7 @@ with the length of the audio. The PyTorch figures are from the session above.
 
 | | Binary (stripped) | Weights file |
 | --- | --- | --- |
-| wb_decode-c | 70 KB | 23 MB (decoder only, f16) |
-| wb_decode-zig | 323 KB | same file |
+| wb_decode | 70 KB | 23 MB (decoder only, f16) |
 | encodec.cpp `decompress`, CPU only | 905 KB | 46.5 MB (encoder + decoder) |
 | encodec.cpp `decompress`, default build with Metal | 1.32 MB | same file |
 | PyTorch `encodec` | 529 MB `torch` package + 332 KB `encodec` + Python | 93 MB checkpoint |
@@ -511,11 +488,10 @@ Upstream encodec.cpp needed four changes to decode these files correctly
   - Done: GEMM-based layers with `neon` and `accelerate` backends.
   - Done: a persistent thread pool, and the LSTM recurrence split across threads
     ([docs/threading.md](docs/threading.md)).
-  - An `avx2` backend for x86, by porting the NEON kernels.
-  - Backends and the thread pool for the Zig version.
-- **Vocos:**
-  - Done: an optional Vocos decoder in the C version (`-Dvocos=true`).
-  - Vocos in the Zig version.
+  - Done: a `blas` backend (OpenBLAS) for Linux servers.
+  - An `avx2` backend for x86 without a BLAS, by porting the NEON kernels.
+  - Faster non-matrix layers in Vocos (depthwise conv, layer norm, GELU, ISTFT).
+- **Vocos:** done, as an optional decoder (`-Dvocos=true`).
 - **Memory:**
   - Done: optional f16 weights in memory (`-Df16=true`), which cuts the peak by about
     23 MB.
@@ -577,13 +553,11 @@ file, pass `--out`. The f32 file matches PyTorch to within 16-bit WAV rounding.
 | Path | Purpose |
 | --- | --- |
 | `README.md`, `MORE.md` | Overview and main numbers; all the details |
-| `c/zencodec.{h,c}` | C17 decoder library |
+| `c/zencodec.{h,c}` | Decoder library: the API and the EnCodec decoder |
 | `c/vocos.c`, `c/internal.h` | Optional Vocos decoder; internals shared by both decoders |
-| `c/backend*.{h,c}` | C compute backends: `ref`, `neon`, `accelerate` |
+| `c/backend*.{h,c}` | Compute backends: `ref`, `neon`, `accelerate`, `blas` |
 | `c/pool.{h,c}` | Persistent fork-join thread pool |
-| `c/play.{h,c}`, `c/main.c` | C command-line tool and playback |
-| `zig/src/zencodec.zig` | Zig decoder (`@Vector` SIMD, `std.Thread`) |
-| `zig/src/play.zig`, `zig/src/main.zig` | Zig command-line tool and playback |
+| `c/play.{h,c}`, `c/main.c` | Command-line tool (`wb_decode`) and playback |
 | `weights/` | Generated weights files (not in the repository; see `scripts/convert.py`) |
 | `scripts/convert.py` | Downloads Meta's checkpoint and builds the weights file |
 | `scripts/convert_vocos.py` | Downloads the Vocos checkpoint and builds its weights file |
@@ -591,7 +565,8 @@ file, pass `--out`. The f32 file matches PyTorch to within 16-bit WAV rounding.
 | `tests/compare.py` | Checks a CLI's output against the PyTorch decoder (EnCodec, or Vocos with `--vocos`) |
 | `bench/` | Benchmark against encodec.cpp and PyTorch, and of Vocos with `--vocos` (scripts and patch) |
 | `docs/` | Decoder architecture, Vocos, threading design, and the diagram |
-| `build.zig` | Builds both CLIs, natively or cross-compiled |
+| `build.zig` | Builds `wb_decode`, natively or cross-compiled |
+| `.github/workflows/` | CI (every backend, accuracy against PyTorch) and releases |
 | `LICENSE` | MIT License for the code |
 
 ## Credits & license
@@ -600,7 +575,7 @@ The decoder follows the structure of
 [encodec.cpp](https://github.com/PABannier/encodec.cpp) by Pierre-Antoine Bannier, and
 the model is [EnCodec](https://github.com/facebookresearch/encodec) by Meta AI.
 
-The FLMSBMP code is released under the [MIT License](LICENSE).
+The code is released under the [MIT License](LICENSE).
 
 | Decoder | Weights | License |
 | --- | --- | --- |

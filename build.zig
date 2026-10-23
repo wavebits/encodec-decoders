@@ -42,7 +42,6 @@ pub fn build(b: *std.Build) void {
     if (f16_weights) flags.append(b.allocator, "-DZENCODEC_F16_WEIGHTS") catch @panic("OOM");
     if (vocos) flags.append(b.allocator, "-DZENCODEC_VOCOS") catch @panic("OOM");
 
-    // C17 implementation
     const c_mod = b.createModule(.{ .target = target, .optimize = optimize, .strip = strip, .link_libc = true });
     c_mod.addCSourceFiles(.{
         .root = b.path("c"),
@@ -52,18 +51,5 @@ pub fn build(b: *std.Build) void {
     if (os == .macos) c_mod.linkFramework("AudioToolbox", .{});
     if (backend == .accelerate) c_mod.linkFramework("Accelerate", .{});
     if (backend == .blas) c_mod.linkSystemLibrary(blas_lib, .{});
-    const c_exe = b.addExecutable(.{ .name = "wb_decode-c", .root_module = c_mod });
-    b.installArtifact(c_exe);
-
-    // Zig implementation
-    const zig_mod = b.createModule(.{
-        .root_source_file = b.path("zig/src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .strip = strip,
-        .link_libc = os == .macos, // AudioToolbox
-    });
-    if (os == .macos) zig_mod.linkFramework("AudioToolbox", .{});
-    const zig_exe = b.addExecutable(.{ .name = "wb_decode-zig", .root_module = zig_mod });
-    b.installArtifact(zig_exe);
+    b.installArtifact(b.addExecutable(.{ .name = "wb_decode", .root_module = c_mod }));
 }

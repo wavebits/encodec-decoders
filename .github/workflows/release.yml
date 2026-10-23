@@ -31,14 +31,14 @@ jobs:
       - run: zig build -Dstrip=true -Dvocos=true ${{ matrix.args }}
       - name: Package
         run: |
-          dir=flmsbmp-${GITHUB_REF_NAME}-${{ matrix.name }}
+          dir=zencodec-${GITHUB_REF_NAME}-${{ matrix.name }}
           mkdir "$dir"
-          cp zig-out/bin/wb_decode-c zig-out/bin/wb_decode-zig LICENSE README.md "$dir"/
+          cp zig-out/bin/wb_decode LICENSE README.md "$dir"/
           tar czf "$dir.tar.gz" "$dir"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
-          path: flmsbmp-*.tar.gz
+          path: zencodec-*.tar.gz
 
   release:
     needs: build
@@ -49,7 +49,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           merge-multiple: true
-      - run: sha256sum flmsbmp-*.tar.gz > SHA256SUMS
+      - run: sha256sum zencodec-*.tar.gz > SHA256SUMS
       - env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" flmsbmp-*.tar.gz SHA256SUMS --repo "$GITHUB_REPOSITORY" --generate-notes
+        run: gh release create "$GITHUB_REF_NAME" zencodec-*.tar.gz SHA256SUMS --repo "$GITHUB_REPOSITORY" --generate-notes

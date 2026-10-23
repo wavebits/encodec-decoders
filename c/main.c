@@ -1,8 +1,8 @@
 // zencodec CLI (C17). Decodes with EnCodec or, given a Vocos weights file and a build
 // with -DZENCODEC_VOCOS, with Vocos.
 //
-//   wb_decode-c decode <weights.bin> <codes.bin|in.ecdc> <out.wav> [-t n_threads]
-//   wb_decode-c play   <weights.bin> <codes.bin|in.ecdc>           [-t n_threads]
+//   wb_decode decode <weights.bin> <codes.bin|in.ecdc> <out.wav> [-t n_threads]
+//   wb_decode play   <weights.bin> <codes.bin|in.ecdc>           [-t n_threads]
 //
 // Codes file (little-endian): int32 n_q, int32 n_frames, int32 codes[n_q][n_frames]
 // (see scripts/encode.py), or an .ecdc file from `encodec` compressed without --lm.
@@ -211,7 +211,7 @@ static void decode_error(const zencodec_model * model, int n_q) {
 
 static int usage(const char * argv0) {
     fprintf(stderr,
-            "FLMSBMP " ZENCODEC_VERSION "\n"
+            "wb_decode " ZENCODEC_VERSION "\n"
             "usage: %s decode <weights.bin> <codes.bin|in.ecdc> <out.wav> [-t n_threads]\n"
             "       %s play   <weights.bin> <codes.bin|in.ecdc>           [-t n_threads]\n",
             argv0, argv0);

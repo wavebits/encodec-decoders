@@ -278,8 +278,8 @@ same `K = 512` inputs in the same order.
   before this change.
 - **accelerate:** with 1 thread, output is identical to before. With more threads, the
   NEON GEMV sums in a different order than cblas, so samples differ by up to 4 LSB of
-  16-bit audio. That is well below the f16 weight rounding (see the README's Accuracy
-  section).
+  16-bit audio. That is well below the f16 weight rounding (see
+  [Accuracy](../MORE.md#accuracy)).
 
 The pool was checked with ThreadSanitizer, with no reports, and with a 40-run stress
 test at 2–8 threads, in which every output was identical.
@@ -302,10 +302,9 @@ test at 2–8 threads, in which every output was identical.
   That needs measuring on such a device first.
 - **f16 `W_hh`.** The recurrence is bandwidth-bound, so storing `W_hh` in f16 halves the
   bytes per step. This is now available as a build option for all weights
-  (`-Df16=true`, see the README). It makes neon's GEMV 20% faster (43 against 54 µs) with
-  bit-identical output, and saves about 23 MB of memory.
-- **The Zig decoder** still runs the recurrence on one thread. It gets the same design
-  when it gets backends.
+  (`-Df16=true`, see [f16 weights](../MORE.md#f16-weights-in-memory)). It makes neon's
+  GEMV 20% faster (43 against 54 µs) with bit-identical output, and saves about 23 MB
+  of memory.
 
 ## Tuning
 

@@ -97,10 +97,9 @@ from multi-scale spectrogram and adversarial losses.
 
 ## How zencodec implements it
 
-Both implementations follow the stages above one to one, as plain loops over `[C][T]`
-float buffers. There is no graph and no tensor library. Names in the table are from
-`c/zencodec.c`; the Zig functions in `zig/src/zencodec.zig` have the same names in
-camelCase.
+The decoder follows the stages above one to one, as plain loops over `[C][T]` float
+buffers. There is no graph and no tensor library. Names in the table are from
+`c/zencodec.c`.
 
 | Stage | Function | Notes |
 |---|---|---|
@@ -119,7 +118,7 @@ first chunk has at least 7 frames.
 
 All parallel work runs on one persistent thread pool per stream (`c/pool.c`). The
 [threading document](threading.md) explains the pool and the parallel recurrence. For
-what limits speed now, see the roadmap in the [README](../README.md#roadmap).
+what limits speed now, see the [roadmap](../MORE.md#roadmap).
 
 ## Reference usage (PyTorch)
 

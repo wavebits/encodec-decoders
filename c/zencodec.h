@@ -1,4 +1,4 @@
-// zencodec: minimal, dependency-free EnCodec (24 kHz) decoder in C17.
+// zencodec: fast, small, dependency-free decoder for EnCodec (24 kHz) codes, in C17.
 // Based on encodec.cpp (https://github.com/PABannier/encodec.cpp).
 //
 // Two decoders turn the same EnCodec codes into audio, chosen by the weights file:
@@ -36,7 +36,8 @@ const char * zencodec_decoder(const zencodec_model * model);
 // much (see zencodec_stream_push).
 int zencodec_lookahead(const zencodec_model * model);
 
-// Name of the compute backend compiled in: "ref", "neon" or "accelerate".
+// Name of the compute backend compiled in: "ref", "neon", "accelerate" or "blas", with
+// "+f16" when the weights are kept in f16.
 const char * zencodec_backend(void);
 
 // Decode `codes` laid out as [n_q][n_frames] (codebook-major) into
@@ -54,7 +55,7 @@ int zencodec_decode(const zencodec_model * model, const int32_t * codes, int n_q
 // input).
 typedef struct zencodec_stream zencodec_stream;
 
-#define ZENCODEC_CHUNK_FRAMES 75 // 1 s; a good chunk size for zencodec_stream_decode
+#define ZENCODEC_CHUNK_FRAMES 75 // 1 s; a good chunk size for zencodec_stream_push
 
 // A stream with n_threads > 1 starts n_threads - 1 worker threads, which it keeps until
 // zencodec_stream_free. Between calls they spin for about 100 us, then sleep. Use a
@@ -74,8 +75,9 @@ int zencodec_stream_push(zencodec_stream * stream, const int32_t * codes, int n_
 // with encodec), or a negative value on error. The stream takes no codes after this.
 int zencodec_stream_flush(zencodec_stream * stream, float * audio);
 
-// For encodec only (returns 4 with vocos): zencodec_stream_push, but returns 0 on
-// success, having written n_frames * hop_length samples.
+// Older form of zencodec_stream_push, for encodec only (returns 4 with vocos): returns 0
+// on success, having written n_frames * hop_length samples; 1 on bad arguments, 2 on a
+// code out of range, 3 when out of memory.
 int zencodec_stream_decode(zencodec_stream * stream, const int32_t * codes, int n_frames, float * audio);
 
 #ifdef __cplusplus

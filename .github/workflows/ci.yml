@@ -72,10 +72,7 @@ jobs:
           [ -f weights/encodec_24khz_decoder_f16.bin ] || python scripts/convert.py --use-f16
           [ -f weights/vocos_encodec_24khz_f16.bin ] || python scripts/convert_vocos.py --use-f16
       - run: zig build -Dvocos=true -Dbackend=${{ matrix.backend }}
-      - name: EnCodec (C)
-        run: python tests/compare.py zig-out/bin/wb_decode-c weights/encodec_24khz_decoder_f16.bin
-      - name: Vocos (C)
-        run: python tests/compare.py zig-out/bin/wb_decode-c weights/vocos_encodec_24khz_f16.bin --vocos
-      - name: EnCodec (Zig)
-        if: matrix.backend == 'ref'
-        run: python tests/compare.py zig-out/bin/wb_decode-zig weights/encodec_24khz_decoder_f16.bin
+      - name: EnCodec
+        run: python tests/compare.py zig-out/bin/wb_decode weights/encodec_24khz_decoder_f16.bin
+      - name: Vocos
+        run: python tests/compare.py zig-out/bin/wb_decode weights/vocos_encodec_24khz_f16.bin --vocos
