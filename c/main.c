@@ -1,4 +1,5 @@
-// zencodec CLI (C17).
+// zencodec CLI (C17). Decodes with EnCodec or, given a Vocos weights file and a build
+// with -DZENCODEC_VOCOS, with Vocos.
 //
 //   wb_decode-c decode <weights.bin> <codes.bin|in.ecdc> <out.wav> [-t n_threads]
 //   wb_decode-c play   <weights.bin> <codes.bin|in.ecdc>           [-t n_threads]
@@ -169,25 +170,43 @@ typedef struct {
     double                 t_done;
 } decode_job;
 
+// Publishes `done` samples to the player.
+static void job_ready(decode_job * j, size_t done) {
+    atomic_store_explicit(&j->ready, done < j->n ? done : j->n, memory_order_release);
+}
+
 static void * decode_job_run(void * arg) {
     decode_job * j = arg;
-    const int hop = zencodec_hop_length(j->model), max_chunk = ZENCODEC_CHUNK_FRAMES;
+    const int max_chunk = ZENCODEC_CHUNK_FRAMES;
     zencodec_stream * s = zencodec_stream_new(j->model, j->n_q, j->n_threads);
     int32_t * chunk = malloc((size_t) j->n_q * max_chunk * sizeof(int32_t));
     j->err = s && chunk ? 0 : 3;
+    size_t done = 0; // samples decoded
     for (int f = 0; f < j->n_frames && j->err == 0; f += max_chunk) {
         const int n = j->n_frames - f < max_chunk ? j->n_frames - f : max_chunk;
         for (int q = 0; q < j->n_q; q++)
             memcpy(chunk + (size_t) q * n, j->codes + (size_t) q * j->n_frames + f, (size_t) n * sizeof(int32_t));
-        j->err = zencodec_stream_decode(s, chunk, n, j->audio + (size_t) f * hop);
-        const size_t done = (size_t) (f + n) * hop;
-        atomic_store_explicit(&j->ready, done < j->n ? done : j->n, memory_order_release);
+        const int w = zencodec_stream_push(s, chunk, n, j->audio + done);
+        if (w < 0) j->err = 3;
+        else       job_ready(j, done += (size_t) w);
+    }
+    if (j->err == 0) { // the audio a decoder with lookahead held back
+        const int w = zencodec_stream_flush(s, j->audio + done);
+        if (w < 0) j->err = 3;
+        else       job_ready(j, done += (size_t) w);
     }
     free(chunk);
     zencodec_stream_free(s);
     j->t_done = now_ms();
     atomic_store_explicit(&j->done, true, memory_order_release);
     return NULL;
+}
+
+static void decode_error(const zencodec_model * model, int n_q) {
+    if (!strcmp(zencodec_decoder(model), "vocos"))
+        fprintf(stderr, "error: decoding failed (n_q = %d; vocos takes 2, 4, 8 or 16: 1.5 to 12 kbps)\n", n_q);
+    else
+        fprintf(stderr, "error: decoding failed (n_q = %d, max %d)\n", n_q, zencodec_n_codebooks(model));
 }
 
 static int usage(const char * argv0) {
@@ -258,19 +277,20 @@ int main(int argc, char ** argv) {
         ret = play_audio_stream(audio, &job.ready, &job.done, sr);
         pthread_join(thread, NULL);
         if (job.err) {
-            fprintf(stderr, "error: decoding failed (n_q = %d, max %d)\n", n_q, zencodec_n_codebooks(model));
+            decode_error(model, n_q);
             ret = 1;
         } else {
             fprintf(stderr, "decode %.1f ms\n", job.t_done - t1);
         }
     } else {
         if (zencodec_decode(model, codes, n_q, n_frames, audio, n_threads) != 0) {
-            fprintf(stderr, "error: decoding failed (n_q = %d, max %d)\n", n_q, zencodec_n_codebooks(model));
+            decode_error(model, n_q);
             return 1;
         }
         const double t2 = now_ms();
         fprintf(stderr, "decoded %.2f s of audio (%d codebooks, %d frames)\n", (double) n / sr, n_q, n_frames);
-        fprintf(stderr, "load %.1f ms, decode %.1f ms (%s backend)\n", t1 - t0, t2 - t1, zencodec_backend());
+        fprintf(stderr, "load %.1f ms, decode %.1f ms (%s decoder, %s backend)\n", t1 - t0, t2 - t1,
+                zencodec_decoder(model), zencodec_backend());
         if (!write_wav(pos[3], audio, n, sr)) {
             fprintf(stderr, "error: cannot write '%s'\n", pos[3]);
             ret = 1;

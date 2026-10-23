@@ -11,6 +11,8 @@ pub fn build(b: *std.Build) void {
     const profile = b.option(bool, "profile", "Print per-stage decode times (C version)") orelse false;
     // keep the weights in f16 in memory (C version): ~23 MB less, not with accelerate
     const f16_weights = b.option(bool, "f16", "Keep weights in f16 in memory (C version; ref and neon backends)") orelse false;
+    // the optional Vocos decoder (C version), for Vocos weights files
+    const vocos = b.option(bool, "vocos", "Include the Vocos decoder (C version)") orelse false;
     const os = target.result.os.tag;
     const is_apple = os == .macos or os == .ios;
 
@@ -35,12 +37,13 @@ pub fn build(b: *std.Build) void {
     }
     if (profile) flags.append(b.allocator, "-DZENCODEC_PROFILE") catch @panic("OOM");
     if (f16_weights) flags.append(b.allocator, "-DZENCODEC_F16_WEIGHTS") catch @panic("OOM");
+    if (vocos) flags.append(b.allocator, "-DZENCODEC_VOCOS") catch @panic("OOM");
 
     // C17 implementation
     const c_mod = b.createModule(.{ .target = target, .optimize = optimize, .strip = strip, .link_libc = true });
     c_mod.addCSourceFiles(.{
         .root = b.path("c"),
-        .files = &.{ "zencodec.c", "pool.c", "backend_ref.c", "backend_neon.c", "backend_accelerate.c", "play.c", "main.c" },
+        .files = &.{ "zencodec.c", "vocos.c", "pool.c", "backend_ref.c", "backend_neon.c", "backend_accelerate.c", "play.c", "main.c" },
         .flags = flags.items,
     });
     if (os == .macos) c_mod.linkFramework("AudioToolbox", .{});

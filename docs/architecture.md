@@ -1,5 +1,8 @@
 # EnCodec decoder architecture
 
+This document covers EnCodec's own decoder. The optional Vocos decoder for the same
+codes is described in [vocos.md](vocos.md).
+
 zencodec runs the decoder of Meta's **EnCodec** neural audio codec (Défossez, Copet,
 Synnaeve & Adi, *High Fidelity Neural Audio Compression*, 2022;
 [facebookresearch/encodec](https://github.com/facebookresearch/encodec)).
@@ -102,15 +105,15 @@ camelCase.
 | Stage | Function | Notes |
 |---|---|---|
 | Load | `zencodec_load`, `bind` | Weight-norm is already folded into the weights by `scripts/convert.py`. f16 is converted to f32 on load, unless the build keeps weights in f16 (`-Df16=true`, `ZENCODEC_F16_WEIGHTS`); then the kernels widen them as they read them. The LSTM's gate rows are reordered (`lstm_reorder`) so the recurrence can be split by hidden unit. |
-| RVQ decode | `zencodec_stream_decode` | Sums `n_q` codebook rows per frame. |
+| RVQ decode | `encodec_decode_chunk` | Sums `n_q` codebook rows per frame. |
 | Conv1d | `conv1d` | A GEMM per tap, run by the backend. `hist` keeps the last `K − 1` input samples between chunks. The first chunk is reflect-padded, as in EnCodec. |
 | LSTM | `lstm_forward`, `lstm_step` | The input projection `W_ih·x` for all frames is one GEMM. The recurrence runs frame by frame, each frame's `W_hh·h` and gates split across threads by hidden unit ([threading.md](threading.md)). `h` and `c` carry over between chunks. |
 | ConvTranspose1d | `conv_transpose1d` | One GEMM for all taps, then an overlap-add parallel over output channels. `tail` keeps the `K − stride` overlap samples for the next chunk. |
-| ResBlock | `zencodec_stream_decode` | `conv1d` (k = 3, with history) → `conv1d` (k = 1), plus the 1×1 `shortcut` conv. |
+| ResBlock | `encodec_decode_chunk` | `conv1d` (k = 3, with history) → `conv1d` (k = 1), plus the 1×1 `shortcut` conv. |
 | ELU | `elu` | In place. |
 
 Because each layer keeps its own small state, `zencodec_decode` is just a loop over
-75-frame (1 s) chunks of `zencodec_stream_decode`. Memory therefore does not depend on
+75-frame (1 s) chunks of `zencodec_stream_push`. Memory therefore does not depend on
 the length of the input. The output matches a single full-length decode as long as the
 first chunk has at least 7 frames.
 

@@ -4,12 +4,14 @@
 // 8-row x 12-column block of C while K is swept, so each loaded value feeds several
 // FMAs instead of one. Weights are packed once at load into 8-row panels ([K][8]);
 // the input is packed per task into 12-column panels ([K][12]). Work is split into
-// MB x NB tiles of C, one task each.
+// MB x NB tiles of C, one task each. K is swept in blocks of KC, so that the panels the
+// micro-kernel streams stay in L1 even for long rows (Vocos has K = 1152). Each element
+// of C still sums over k in order, so the result is the same as without blocking.
 //
 // With ZENCODEC_F16_WEIGHTS the panels hold halves. The GEMV, which is bound by memory
 // bandwidth, widens them as it loads them (FCVTL), so it reads half the bytes. The GEMM
-// is bound by arithmetic instead, so it widens each 8-row panel of A once into an f32
-// buffer on the stack and runs the f32 micro-kernel on it over all of the tile's
+// is bound by arithmetic instead, so it widens each 8-row x KC block of A once into an
+// f32 buffer on the stack and runs the f32 micro-kernel on it over all of the tile's
 // columns: the conversion is spread over NB columns.
 
 #if defined(ZENCODEC_BACKEND_NEON)
@@ -24,7 +26,7 @@
 #define NR 12 // columns per micro-kernel (B panel width)
 #define MB 64 // rows per task, a multiple of MR
 #define NB 96 // columns per task, a multiple of NR
-#define MAX_K_F16 1024 // largest K packed with f16 weights (one widened panel is 32 KB of stack)
+#define KC 256 // K per block
 
 // Loads 8 weights starting at p as two float32x4_t, lo and hi.
 #ifdef ZENCODEC_F16_WEIGHTS
@@ -39,9 +41,6 @@
 // Matrices whose block height is not a multiple of MR (only the 1-channel output
 // conv) stay row-major and use the reference code.
 bool zc_mat_prepare(zc_mat * a) {
-#ifdef ZENCODEC_F16_WEIGHTS
-    if (a->K > MAX_K_F16) return true;
-#endif
     if (a->M % MR) return true;
     const int panels = a->taps * a->M / MR;
     zc_weight * p = malloc((size_t) panels * MR * a->K * sizeof(zc_weight));
@@ -109,42 +108,46 @@ static void gemm_tile(void * p, int i) {
     const int nb = c->N - n0 < NB ? c->N - n0 : NB;
     const int nq = (nb + NR - 1) / NR;
 
-    float * bp = malloc((size_t) K * nq * NR * sizeof(float));
+    float * bp = malloc((size_t) KC * nq * NR * sizeof(float));
     if (!bp) abort();
     for (int tap = 0; tap < c->a->taps; tap++) {
-        // pack B[:, tap + n0 : tap + n0 + nb] into 12-column panels, zero-padded
-        for (int q = 0; q < nq; q++) {
-            const int cols = nb - q * NR < NR ? nb - q * NR : NR;
-            float * dst = bp + (size_t) q * K * NR;
-            for (int k = 0; k < K; k++) {
-                const float * src = c->B + (size_t) k * c->ldb + tap + n0 + q * NR;
-                memcpy(dst + (size_t) k * NR, src, (size_t) cols * sizeof(float));
-                for (int j = cols; j < NR; j++) dst[(size_t) k * NR + j] = 0.0f;
-            }
-        }
-        const zc_weight * ap = (const zc_weight *) c->a->packed + ((size_t) tap * M + m0) * K;
-        for (int r = 0; r < mb; r += MR) {
-#ifdef ZENCODEC_F16_WEIGHTS
-            float a[MR * MAX_K_F16]; // zc_mat_prepare keeps K <= MAX_K_F16 when packing
-            for (int j = 0; j < MR * K; j += 8) {
-                LOAD8(ap + (size_t) r * K + j, lo, hi);
-                vst1q_f32(a + j, lo);
-                vst1q_f32(a + j + 4, hi);
-            }
-#else
-            const float * a = ap + (size_t) r * K;
-#endif
+        for (int k0 = 0; k0 < K; k0 += KC) {
+            const int kc = K - k0 < KC ? K - k0 : KC;
+            // pack B[k0 : k0 + kc, tap + n0 : tap + n0 + nb] into 12-column panels, zero-padded
             for (int q = 0; q < nq; q++) {
                 const int cols = nb - q * NR < NR ? nb - q * NR : NR;
-                const float * b = bp + (size_t) q * K * NR;
-                float * cc = c->C + (size_t) (m0 + r) * c->ldc + n0 + q * NR;
-                if (cols == NR) {
-                    kernel_8x12(K, a, b, cc, c->ldc);
-                } else { // right edge: go through a full-width scratch tile
-                    float t[MR * NR] = {0};
-                    for (int rr = 0; rr < MR; rr++) memcpy(t + rr * NR, cc + (size_t) rr * c->ldc, cols * sizeof(float));
-                    kernel_8x12(K, a, b, t, NR);
-                    for (int rr = 0; rr < MR; rr++) memcpy(cc + (size_t) rr * c->ldc, t + rr * NR, cols * sizeof(float));
+                float * dst = bp + (size_t) q * kc * NR;
+                for (int k = 0; k < kc; k++) {
+                    const float * src = c->B + (size_t) (k0 + k) * c->ldb + tap + n0 + q * NR;
+                    memcpy(dst + (size_t) k * NR, src, (size_t) cols * sizeof(float));
+                    for (int j = cols; j < NR; j++) dst[(size_t) k * NR + j] = 0.0f;
+                }
+            }
+            const zc_weight * ap = (const zc_weight *) c->a->packed + ((size_t) tap * M + m0) * K;
+            for (int r = 0; r < mb; r += MR) {
+                const zc_weight * panel = ap + (size_t) r * K + (size_t) k0 * MR; // [K][8]: rows k0.. are contiguous
+#ifdef ZENCODEC_F16_WEIGHTS
+                float a[MR * KC];
+                for (int j = 0; j < MR * kc; j += 8) {
+                    LOAD8(panel + j, lo, hi);
+                    vst1q_f32(a + j, lo);
+                    vst1q_f32(a + j + 4, hi);
+                }
+#else
+                const float * a = panel;
+#endif
+                for (int q = 0; q < nq; q++) {
+                    const int cols = nb - q * NR < NR ? nb - q * NR : NR;
+                    const float * b = bp + (size_t) q * kc * NR;
+                    float * cc = c->C + (size_t) (m0 + r) * c->ldc + n0 + q * NR;
+                    if (cols == NR) {
+                        kernel_8x12(kc, a, b, cc, c->ldc);
+                    } else { // right edge: go through a full-width scratch tile
+                        float t[MR * NR] = {0};
+                        for (int rr = 0; rr < MR; rr++) memcpy(t + rr * NR, cc + (size_t) rr * c->ldc, cols * sizeof(float));
+                        kernel_8x12(kc, a, b, t, NR);
+                        for (int rr = 0; rr < MR; rr++) memcpy(cc + (size_t) rr * c->ldc, t + rr * NR, cols * sizeof(float));
+                    }
                 }
             }
         }

@@ -1,10 +1,11 @@
-"""Decode an .ecdc file with Meta's reference PyTorch `encodec` package (benchmark baseline).
+"""Decode an .ecdc file with Meta's reference PyTorch `encodec` package (benchmark baseline),
+or with --vocos, with the reference PyTorch Vocos (charactr/vocos-encodec-24khz).
 
 Prints the model-load and decode times to stderr, like the other decoders.
 
 Usage:
-    pip install encodec torch
-    python bench/python_decode.py in.ecdc out.wav [-t n_threads] [--float]
+    pip install encodec torch         (and vocos, for --vocos)
+    python bench/python_decode.py in.ecdc out.wav [-t n_threads] [--float] [--vocos]
 """
 import argparse
 import struct
@@ -38,11 +39,17 @@ def main():
     parser.add_argument("output")
     parser.add_argument("-t", "--threads", type=int, default=4)
     parser.add_argument("--float", action="store_true", help="write a 32-bit float WAV")
+    parser.add_argument("--vocos", action="store_true", help="decode with Vocos")
     args = parser.parse_args()
 
     torch.set_num_threads(args.threads)
     t0 = time.perf_counter()
-    model = EncodecModel.encodec_model_24khz()
+    if args.vocos:
+        from vocos import Vocos
+        vocos = Vocos.from_pretrained("charactr/vocos-encodec-24khz").eval()
+        model = vocos.feature_extractor.encodec  # for its sample rate and bit unpacking
+    else:
+        model = EncodecModel.encodec_model_24khz()
     t1 = time.perf_counter()
 
     # same steps as encodec.compress.decompress_from_file, without its model reload
@@ -57,7 +64,13 @@ def main():
     frame = torch.tensor(codes, dtype=torch.long).T[None]  # [1, n_q, T]
     t2 = time.perf_counter()
     with torch.no_grad():
-        wav = model.decode([(frame, None)])[0, 0, :n_samples]
+        if args.vocos:
+            if n_q not in (2, 4, 8, 16):
+                sys.exit("error: Vocos takes 2, 4, 8 or 16 codebooks (1.5 to 12 kbps)")
+            bandwidth_id = torch.tensor([[2, 4, 8, 16].index(n_q)])
+            wav = vocos.decode(vocos.codes_to_features(frame[0]), bandwidth_id=bandwidth_id)[0, :n_samples]
+        else:
+            wav = model.decode([(frame, None)])[0, 0, :n_samples]
     t3 = time.perf_counter()
 
     write_wav(args.output, wav.numpy(), model.sample_rate, args.float)

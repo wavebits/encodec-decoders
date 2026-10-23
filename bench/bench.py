@@ -13,10 +13,14 @@ of them alike. Results go to:
   - bench/results/<date>_<commit>.md, with the machine description
   - bench/results/history.csv, one row per decoder/input/thread count, appended over time
 
+With --vocos, it also builds wb_decode-c with the Vocos decoder (-Dvocos=true) for each
+backend, runs it with the Vocos weights, and adds PyTorch Vocos, which is the accuracy
+reference for those rows.
+
 Usage:
     python bench/bench.py in.ecdc [more.ecdc ...] [-t 1,4] [-r 3]
         [--backends ref,neon,accelerate,neon+f16,ref+f16] [--baseline <git rev>]
-        [--no-encodec-cpp] [--no-pytorch] [--note "text"]
+        [--vocos] [--no-zig] [--no-encodec-cpp] [--no-pytorch] [--no-accuracy] [--note "text"]
 
 Make inputs with `encodec -b 6 input.wav in.ecdc` (24 kHz model, no --lm).
 Needs zig. encodec.cpp needs git, cmake and a C++ compiler; PyTorch and the accuracy
@@ -40,6 +44,7 @@ ROOT = Path(__file__).resolve().parent.parent
 WORK = ROOT / "bench" / "work"
 RESULTS = ROOT / "bench" / "results"
 WEIGHTS = ROOT / "weights" / "encodec_24khz_decoder_f16.bin"
+VOCOS_WEIGHTS = ROOT / "weights" / "vocos_encodec_24khz_f16.bin"
 ENCODEC_CPP_COMMIT = "83deb38a757a12a58f993e34a44d32b3fd5d3893"
 ENCODEC_MAX_NODES = 400000  # encodec.cpp builds one graph per file; raise its node cap
 CHECKPOINT_URL = "https://dl.fbaipublicfiles.com/encodec/v0/encodec_24khz-d7cc33bc.th"
@@ -110,15 +115,21 @@ def zig_flags(backend):
     return [f"-Dbackend={name}"] + (["-Df16=true"] if variant == "f16" else [])
 
 
-def build_flmsbmp(backends):
-    """Builds wb_decode-c once per backend, plus wb_decode-zig. Returns decoder specs."""
+def build_flmsbmp(backends, vocos, zig=True):
+    """Builds wb_decode-c once per backend, plus wb_decode-zig, and with `vocos` once more
+    per backend with the Vocos decoder. Returns decoder specs."""
     decoders = []
     for i, backend in enumerate(backends):
         prefix = WORK / f"build-{backend}"
         run(["zig", "build", *zig_flags(backend), "-Dstrip=true", "-p", str(prefix)], cwd=ROOT)
         decoders.append(cli_decoder(f"wb_decode-c ({backend})", prefix / "bin" / "wb_decode-c", backend))
-        if i == 0:
+        if i == 0 and zig:
             decoders.append(cli_decoder("wb_decode-zig", prefix / "bin" / "wb_decode-zig", "zig"))
+    for backend in backends if vocos else []:
+        prefix = WORK / f"build-{backend}-vocos"
+        run(["zig", "build", *zig_flags(backend), "-Dvocos=true", "-Dstrip=true", "-p", str(prefix)], cwd=ROOT)
+        decoders.append(cli_decoder(f"wb_decode-c vocos ({backend})", prefix / "bin" / "wb_decode-c",
+                                    f"{backend}+vocos", VOCOS_WEIGHTS, "vocos"))
     return decoders
 
 
@@ -148,10 +159,11 @@ def build_baseline(rev, backends):
     return decoders
 
 
-def cli_decoder(name, exe, backend):
+def cli_decoder(name, exe, backend, weights=WEIGHTS, ref="encodec"):
+    """`ref`: the PyTorch decoder whose output this one is compared with."""
     return {
-        "name": name, "backend": backend, "size": exe.stat().st_size,
-        "cmd": lambda inp, out, t, exe=exe: [str(exe), "decode", str(WEIGHTS), str(inp), str(out), "-t", str(t)],
+        "name": name, "backend": backend, "size": exe.stat().st_size, "ref": ref,
+        "cmd": lambda inp, out, t, exe=exe: [str(exe), "decode", str(weights), str(inp), str(out), "-t", str(t)],
         "decode_re": r"decode ([\d.]+) ms",
     }
 
@@ -178,23 +190,28 @@ def build_encodec_cpp():
     run(["cmake", "--build", str(build), "-j", "--target", "decompress"], capture_output=True)
     exe = build / "bin" / "decompress"
     return {
-        "name": "encodec.cpp", "backend": "ggml cpu", "size": exe.stat().st_size,
+        "name": "encodec.cpp", "backend": "ggml cpu", "size": exe.stat().st_size, "ref": "encodec",
         "cmd": lambda inp, out, t: [str(exe), "-m", str(weights), "-i", str(inp), "-o", str(out), "-t", str(t)],
         "decode_re": r"eval time =\s*([\d.]+) ms",
     }
 
 
-def pytorch_decoder():
-    probe = "import encodec, torch, os; print(os.path.dirname(torch.__file__)); print(os.path.dirname(encodec.__file__))"
+def pytorch_decoder(vocos=False):
+    """PyTorch encodec, or with `vocos` PyTorch Vocos. Its size is that of the installed
+    packages it imports (Vocos also needs encodec and torchaudio)."""
+    mods = ["torch", "encodec"] + (["torchaudio", "vocos"] if vocos else [])
+    probe = f"import os, {', '.join(mods)}; " + "; ".join(f"print(os.path.dirname({m}.__file__))" for m in mods)
     out = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
     if out.returncode != 0:
         return None
     size = sum(dir_size(Path(p)) for p in out.stdout.split())
     script = ROOT / "bench" / "python_decode.py"
+    flags = ["--float"] + (["--vocos"] if vocos else [])
     return {
-        "name": "PyTorch encodec", "backend": "torch", "size": size,
+        "name": "PyTorch vocos" if vocos else "PyTorch encodec", "backend": "torch",
+        "size": size, "ref": "vocos" if vocos else "encodec",
         # float output, like the other decoders, so its SNR isn't limited by 16-bit rounding
-        "cmd": lambda inp, out, t: [sys.executable, str(script), str(inp), str(out), "-t", str(t), "--float"],
+        "cmd": lambda inp, out, t: [sys.executable, str(script), str(inp), str(out), "-t", str(t), *flags],
         "decode_re": r"decode ([\d.]+) ms",
     }
 
@@ -255,10 +272,13 @@ def read_wav(path):
 
 
 def snr(ref, out):
-    """Overall SNR and the worst 1 s SNR, in dB."""
+    """Overall SNR and the worst 1 s SNR, in dB. The reference is clipped to [-1, 1] like
+    the 16-bit output of the other decoders, so peaks beyond full scale (Vocos has some)
+    don't count as errors."""
     import numpy as np
     n = min(len(ref), len(out))
-    r, e = ref[:n], ref[:n] - out[:n]
+    r = np.clip(ref[:n], -1.0, 1.0)
+    e = r - out[:n]
     def db(a, b):
         return float(10 * np.log10(max(np.sum(a ** 2), 1e-20) / max(np.sum(b ** 2), 1e-20)))
     per_s = [db(r[i:i + SAMPLE_RATE], e[i:i + SAMPLE_RATE]) for i in range(0, n - SAMPLE_RATE + 1, SAMPLE_RATE)]
@@ -280,8 +300,12 @@ def main():
     ap.add_argument("-r", "--runs", type=int, default=3)
     ap.add_argument("--backends", default=None, help="comma-separated C backends (default: all for this machine)")
     ap.add_argument("--baseline", default=None, help="also build wb_decode-c from this git revision")
+    ap.add_argument("--vocos", action="store_true", help="also benchmark the Vocos decoder and PyTorch Vocos")
+    ap.add_argument("--no-zig", action="store_true")
     ap.add_argument("--no-encodec-cpp", action="store_true")
     ap.add_argument("--no-pytorch", action="store_true")
+    ap.add_argument("--no-accuracy", action="store_true",
+                    help="skip the PyTorch reference decodes (they need GBs of memory for long inputs)")
     ap.add_argument("--note", default="", help="free text stored with the results")
     args = ap.parse_args()
     threads = [int(t) for t in args.threads.split(",")]
@@ -289,10 +313,12 @@ def main():
 
     if not WEIGHTS.exists():
         run([sys.executable, str(ROOT / "scripts" / "convert.py"), "--use-f16", "--out", str(WEIGHTS)])
+    if args.vocos and not VOCOS_WEIGHTS.exists():
+        run([sys.executable, str(ROOT / "scripts" / "convert_vocos.py"), "--use-f16", "--out", str(VOCOS_WEIGHTS)])
 
     print("building ...", file=sys.stderr)
     backends = args.backends.split(",") if args.backends else default_backends()
-    decoders = build_flmsbmp(backends)
+    decoders = build_flmsbmp(backends, args.vocos, not args.no_zig)
     if args.baseline:  # each baseline build goes right after the current build of its backend
         for base in build_baseline(args.baseline, backends):
             after = next((i for i, d in enumerate(decoders) if base["backend"].startswith(d["backend"] + "@")),
@@ -300,20 +326,23 @@ def main():
             decoders.insert(after + 1, base)
     if not args.no_encodec_cpp:
         decoders.append(build_encodec_cpp())
-    py = None if args.no_pytorch else pytorch_decoder()
-    if py:
-        decoders.append(py)
+    kinds = ["encodec"] + (["vocos"] if args.vocos else [])
+    for kind in [] if args.no_pytorch else kinds:
+        py = pytorch_decoder(kind == "vocos")
+        if py:
+            decoders.append(py)
 
-    # accuracy reference: the PyTorch decoder, in float
-    refs = {}
-    if pytorch_decoder():
+    # accuracy references: the PyTorch decoders, in float
+    refs = {}  # (kind, input) -> samples
+    for kind in [] if args.no_accuracy else kinds:
+        if not pytorch_decoder(kind == "vocos"):
+            print(f"note: pip install {kind} torch numpy to measure accuracy against it", file=sys.stderr)
+            continue
         for inp in args.inputs:
-            out = WORK / f"ref_{inp.stem}.wav"
-            run([sys.executable, str(ROOT / "bench" / "python_decode.py"), str(inp), str(out), "--float"],
-                capture_output=True)
-            refs[inp] = read_wav(out)
-    else:
-        print("note: pip install encodec torch numpy to measure accuracy", file=sys.stderr)
+            out = WORK / f"ref_{kind}_{inp.stem}.wav"
+            run([sys.executable, str(ROOT / "bench" / "python_decode.py"), str(inp), str(out), "--float"]
+                + (["--vocos"] if kind == "vocos" else []), capture_output=True)
+            refs[(kind, inp)] = read_wav(out)
 
     info = system_info()
     info["load_start"] = load_average()
@@ -328,8 +357,8 @@ def main():
                     m = re.search(d["decode_re"], err)
                     meas = {"wall": wall, "user": user, "sys": sys_, "peak": peak,
                             "decode": float(m.group(1)) / 1e3 if m else None}
-                    if inp in refs and d is not py:  # PyTorch is the reference itself
-                        meas["snr"], meas["snr_min"] = snr(refs[inp], read_wav(out))
+                    if (d["ref"], inp) in refs and d["backend"] != "torch":  # PyTorch is the reference
+                        meas["snr"], meas["snr_min"] = snr(refs[(d["ref"], inp)], read_wav(out))
                     samples.setdefault((d["name"], inp, t), []).append(meas)
                     print(f"run {r + 1}/{args.runs}  {d['name']:24s} {inp.name} -t {t}: "
                           f"wall {wall:.2f} s, peak {peak / 1e6:.0f} MB", file=sys.stderr)

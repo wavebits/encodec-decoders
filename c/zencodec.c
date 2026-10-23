@@ -13,34 +13,14 @@
 #endif
 
 #include "zencodec.h"
-#include "backend.h"
+#include "internal.h"
 
-#include <math.h>
-#include <stdbool.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <time.h>
 
 #define GGML_MAGIC  0x67676d6c
-#define MAX_TENSORS 512
 #define MAX_Q       64
 
 static const int RATIOS[4] = {8, 5, 4, 2};
-
-typedef struct {
-    char    name[96];
-    int     n_dims;
-    int     shape[4]; // PyTorch order (outermost first)
-    size_t      numel;
-    zc_weight * data; // f32, or f16 with ZENCODEC_F16_WEIGHTS (matrices and codebooks)
-    float     * f;    // 0- and 1-D tensors (biases) instead: always f32, they are tiny
-} tensor;
-
-typedef struct {
-    int     C, T;
-    float * d;
-} act;
 
 // w is laid out for zc_gemm: K stacked [C_out][C_in] taps (conv), or one
 // [K * C_out][C_in] matrix (conv-transpose)
@@ -69,10 +49,11 @@ typedef struct {
 } decoder_block;
 
 struct zencodec_model {
+    vocos_model * vocos; // set for a Vocos weights file, and nothing else below is
+
     int hidden_dim, n_bins, sample_rate;
 
-    tensor tensors[MAX_TENSORS];
-    int    n_tensors;
+    zc_store store;
 
     const tensor * codebooks[MAX_Q]; // [n_bins][hidden_dim] each
     int            n_codebooks;
@@ -86,53 +67,20 @@ struct zencodec_model {
 // optional per-stage timing (-DZENCODEC_PROFILE), printed by zencodec_free
 
 #ifdef ZENCODEC_PROFILE
-enum { P_RVQ, P_CONV, P_LSTM_IN, P_LSTM_REC, P_CONVT, P_RES, P_ELU, P_N };
 static const char * const prof_names[P_N] = {
     "rvq decode", "conv1d", "lstm input gemm", "lstm recurrence", "conv-transpose", "resblock add", "elu",
+    "embed conv", "dwconv", "layer norm", "mlp gemm", "gelu", "head gemm", "istft",
 };
-static double prof_ms[P_N];
-static double now_ms(void) {
+double zc_prof_ms[P_N];
+double zc_now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
 }
-#define PROF_BEGIN() const double prof_t0 = now_ms()
-#define PROF_END(stage) (prof_ms[stage] += now_ms() - prof_t0)
-#else
-#define PROF_BEGIN() ((void) 0)
-#define PROF_END(stage) ((void) 0)
 #endif
 
 // ---------------------------------------------------------------------------
 // helpers
-
-static act act_new(int C, int T) {
-    act a = {C, T, calloc((size_t) C * T, sizeof(float))};
-    return a;
-}
-
-static void act_free(act * a) { free(a->d); a->d = NULL; }
-
-static float * row(const act * a, int c) { return a->d + (size_t) c * a->T; }
-
-// exp(x), within about 2 ulp of expf (Cephes coefficients). Branch-free, so loops
-// over it vectorize; libm's expf/expm1f/tanhf calls don't.
-static inline float exp_approx(float x) {
-    x = fminf(fmaxf(x, -87.0f), 88.0f);
-    const float n = floorf(x * 1.44269504f + 0.5f); // round(x / ln 2)
-    const float r = x - n * 0.693359375f + n * 2.12194440e-4f; // x - n ln 2, in two parts
-    float p = 1.9875691500e-4f;
-    p = p * r + 1.3981999507e-3f;
-    p = p * r + 8.3334519073e-3f;
-    p = p * r + 4.1665795894e-2f;
-    p = p * r + 1.6666665459e-1f;
-    p = p * r + 5.0000001201e-1f;
-    p = p * r * r + r + 1.0f;
-    const int32_t bits = ((int32_t) n + 127) << 23; // 2^n
-    float scale;
-    memcpy(&scale, &bits, sizeof(scale));
-    return p * scale;
-}
 
 static inline float sigmoid(float x) { return 1.0f / (1.0f + exp_approx(-x)); }
 static inline float tanh_approx(float x) { return 2.0f * sigmoid(2.0f * x) - 1.0f; }
@@ -359,7 +307,7 @@ static bool starts_with(const char * s, const char * prefix) {
     return strncmp(s, prefix, strlen(prefix)) == 0;
 }
 
-static bool load_tensors(zencodec_model * m, FILE * f) {
+bool zc_store_load(zc_store * s, FILE * f, const char * const * prefixes) {
     for (;;) {
         int32_t n_dims, name_len, ftype;
         if (!read_i32(f, &n_dims)) return true; // clean EOF
@@ -374,13 +322,14 @@ static bool load_tensors(zencodec_model * m, FILE * f) {
         if (fread(t.name, 1, name_len, f) != (size_t) name_len) return false;
         t.name[name_len] = '\0';
 
-        const bool keep = starts_with(t.name, "decoder.") || starts_with(t.name, "quantizer.");
+        bool keep = false;
+        for (const char * const * p = prefixes; *p && !keep; p++) keep = starts_with(t.name, *p);
         const size_t nbytes = t.numel * (ftype ? 2 : 4);
         if (!keep) {
             if (fseek(f, (long) nbytes, SEEK_CUR) != 0) return false;
             continue;
         }
-        if (m->n_tensors == MAX_TENSORS) return false;
+        if (s->n == MAX_TENSORS) return false;
 
         const bool is_f32 = n_dims <= 1; // biases, including the 0-dim one of the last conv
         const size_t elem = is_f32 ? sizeof(float) : sizeof(zc_weight);
@@ -388,7 +337,7 @@ static bool load_tensors(zencodec_model * m, FILE * f) {
         if (!dst) return false;
         if (is_f32) t.f = dst;
         else        t.data = dst;
-        m->tensors[m->n_tensors++] = t; // owned by the model from here on
+        s->t[s->n++] = t; // owned by the store from here on
         if (nbytes == t.numel * elem) { // stored as we keep it
             if (fread(dst, 1, nbytes, f) != nbytes) return false;
         } else { // f16 file into f32, or f32 file into f16 weights
@@ -405,15 +354,23 @@ static bool load_tensors(zencodec_model * m, FILE * f) {
     }
 }
 
-static const tensor * find(const zencodec_model * m, const char * name) {
-    for (int i = 0; i < m->n_tensors; i++) {
-        if (strcmp(m->tensors[i].name, name) == 0) return &m->tensors[i];
+void zc_store_free(zc_store * s) {
+    for (int i = 0; i < s->n; i++) {
+        free(s->t[i].data);
+        free(s->t[i].f);
+    }
+    s->n = 0;
+}
+
+const tensor * zc_find(const zc_store * s, const char * name) {
+    for (int i = 0; i < s->n; i++) {
+        if (strcmp(s->t[i].name, name) == 0) return &s->t[i];
     }
     return NULL;
 }
 
-static const tensor * get(const zencodec_model * m, const char * name, size_t numel) {
-    const tensor * t = find(m, name);
+const tensor * zc_get(const zc_store * s, const char * name, size_t numel) {
+    const tensor * t = zc_find(s, name);
     if (!t) {
         fprintf(stderr, "zencodec: missing tensor '%s'\n", name);
         return NULL;
@@ -425,15 +382,13 @@ static const tensor * get(const zencodec_model * m, const char * name, size_t nu
     return t;
 }
 
-// Hands a weight matrix to the backend. Takes ownership of `data`.
-static bool make_mat(zc_mat * mat, zc_weight * data, int taps, int M, int K) {
+bool zc_make_mat(zc_mat * mat, zc_weight * data, int taps, int M, int K) {
     *mat = (zc_mat) {M, K, taps, data, NULL};
     return data && zc_mat_prepare(mat);
 }
 
-// Takes a tensor's data out of the model (the matrices built from it replace it).
-static zc_weight * take(zencodec_model * m, const tensor * t) {
-    tensor * mt = &m->tensors[t - m->tensors];
+zc_weight * zc_take(zc_store * s, const tensor * t) {
+    tensor * mt = &s->t[t - s->t];
     zc_weight * d = mt->data;
     mt->data = NULL;
     return d;
@@ -460,13 +415,13 @@ static bool bind_conv(zencodec_model * m, conv * cv, const char * prefix, int C_
                       bool transpose) {
     char name[128];
     snprintf(name, sizeof(name), "%s.weight", prefix);
-    const tensor * w = get(m, name, (size_t) C_out * C_in * K);
+    const tensor * w = zc_get(&m->store, name, (size_t) C_out * C_in * K);
     snprintf(name, sizeof(name), "%s.bias", prefix);
-    cv->b = get(m, name, (size_t) C_out);
+    cv->b = zc_get(&m->store, name, (size_t) C_out);
     if (!w || !cv->b || !cv->b->f || w->n_dims != 3) return false;
     cv->C_in = C_in, cv->C_out = C_out, cv->K = K;
 
-    zc_weight * src = take(m, w);
+    zc_weight * src = zc_take(&m->store, w);
     zc_weight * dst = malloc((size_t) C_out * C_in * K * sizeof(zc_weight));
     if (dst) {
         for (int co = 0; co < C_out; co++)
@@ -478,7 +433,7 @@ static bool bind_conv(zencodec_model * m, conv * cv, const char * prefix, int C_
                 }
     }
     free(src);
-    return transpose ? make_mat(&cv->w, dst, 1, K * C_out, C_in) : make_mat(&cv->w, dst, K, C_out, C_in);
+    return transpose ? zc_make_mat(&cv->w, dst, 1, K * C_out, C_in) : zc_make_mat(&cv->w, dst, K, C_out, C_in);
 }
 
 static bool bind(zencodec_model * m) {
@@ -487,7 +442,7 @@ static bool bind(zencodec_model * m) {
 
     for (int i = 0; i < MAX_Q; i++) {
         snprintf(name, sizeof(name), "quantizer.vq.layers.%d._codebook.embed", i);
-        const tensor * t = find(m, name);
+        const tensor * t = zc_find(&m->store, name);
         if (!t) break;
         if (t->numel != (size_t) m->n_bins * H || !t->data) return false;
         m->codebooks[m->n_codebooks++] = t;
@@ -504,13 +459,13 @@ static bool bind(zencodec_model * m) {
     for (int l = 0; l < 2; l++) {
         lstm_layer * ll = &m->lstm[l];
         snprintf(name, sizeof(name), "decoder.model.1.lstm.weight_ih_l%d", l);
-        const tensor * w_ih = get(m, name, (size_t) 4 * ch * ch);
+        const tensor * w_ih = zc_get(&m->store, name, (size_t) 4 * ch * ch);
         snprintf(name, sizeof(name), "decoder.model.1.lstm.weight_hh_l%d", l);
-        const tensor * w_hh = get(m, name, (size_t) 4 * ch * ch);
+        const tensor * w_hh = zc_get(&m->store, name, (size_t) 4 * ch * ch);
         snprintf(name, sizeof(name), "decoder.model.1.lstm.bias_ih_l%d", l);
-        const tensor * b_ih = get(m, name, (size_t) 4 * ch);
+        const tensor * b_ih = zc_get(&m->store, name, (size_t) 4 * ch);
         snprintf(name, sizeof(name), "decoder.model.1.lstm.bias_hh_l%d", l);
-        const tensor * b_hh = get(m, name, (size_t) 4 * ch);
+        const tensor * b_hh = zc_get(&m->store, name, (size_t) 4 * ch);
         if (!w_ih || !w_hh || !b_ih || !b_hh) return false;
         float * bias = malloc((size_t) 4 * ch * sizeof(float));
         if (!bias || !b_ih->f || !b_hh->f) { free(bias); return false; }
@@ -518,11 +473,11 @@ static bool bind(zencodec_model * m) {
         ll->bias = lstm_reorder(bias, ch, 1, sizeof(float));
         free(bias);
         if (!ll->bias) return false;
-        zc_weight * w = take(m, w_ih);
-        const bool ok_ih = make_mat(&ll->w_ih, lstm_reorder(w, ch, ch, sizeof(zc_weight)), 1, 4 * ch, ch);
+        zc_weight * w = zc_take(&m->store, w_ih);
+        const bool ok_ih = zc_make_mat(&ll->w_ih, lstm_reorder(w, ch, ch, sizeof(zc_weight)), 1, 4 * ch, ch);
         free(w);
-        w = take(m, w_hh);
-        const bool ok_hh = make_mat(&ll->w_hh, lstm_reorder(w, ch, ch, sizeof(zc_weight)), 1, 4 * ch, ch);
+        w = zc_take(&m->store, w_hh);
+        const bool ok_hh = zc_make_mat(&ll->w_hh, lstm_reorder(w, ch, ch, sizeof(zc_weight)), 1, 4 * ch, ch);
         free(w);
         if (!ok_ih || !ok_hh) return false;
     }
@@ -555,15 +510,26 @@ zencodec_model * zencodec_load(const char * path) {
 
     zencodec_model * m = calloc(1, sizeof(*m));
     int32_t magic = 0, hp[9];
-    bool ok = m && read_i32(f, &magic) && magic == GGML_MAGIC && fread(hp, sizeof(int32_t), 9, f) == 9;
-    if (ok) {
-        // in_channels, hidden_dim, n_filters, kernel_size, res_kernel_size, n_bins, bandwidth, sr, ftype
-        m->hidden_dim  = hp[1];
-        m->n_bins      = hp[5];
-        m->sample_rate = hp[7];
-        ok = hp[0] == 1 && hp[1] > 0 && hp[2] == 32 && hp[3] == 7 && hp[4] == 3 && hp[5] > 0;
+    bool ok = m && read_i32(f, &magic);
+    if (ok && magic == VOCOS_MAGIC) {
+#ifdef ZENCODEC_VOCOS
+        ok = (m->vocos = vocos_load(f)) != NULL;
+#else
+        fprintf(stderr, "zencodec: '%s' is a Vocos weights file; build with -DZENCODEC_VOCOS to load it\n", path);
+        ok = false;
+#endif
+    } else {
+        ok = ok && magic == GGML_MAGIC && fread(hp, sizeof(int32_t), 9, f) == 9;
+        if (ok) {
+            // in_channels, hidden_dim, n_filters, kernel_size, res_kernel_size, n_bins, bandwidth, sr, ftype
+            m->hidden_dim  = hp[1];
+            m->n_bins      = hp[5];
+            m->sample_rate = hp[7];
+            ok = hp[0] == 1 && hp[1] > 0 && hp[2] == 32 && hp[3] == 7 && hp[4] == 3 && hp[5] > 0;
+        }
+        static const char * const prefixes[] = {"decoder.", "quantizer.", NULL};
+        ok = ok && zc_store_load(&m->store, f, prefixes) && bind(m);
     }
-    ok = ok && load_tensors(m, f) && bind(m);
     fclose(f);
 
     if (!ok) {
@@ -580,10 +546,15 @@ void zencodec_free(zencodec_model * model) {
     if (!model) return;
 #ifdef ZENCODEC_PROFILE
     double total = 0;
-    for (int i = 0; i < P_N; i++) total += prof_ms[i];
+    for (int i = 0; i < P_N; i++) total += zc_prof_ms[i];
     fprintf(stderr, "zencodec profile (%s backend):\n", zc_backend_name());
-    for (int i = 0; i < P_N; i++)
-        fprintf(stderr, "  %-16s %9.1f ms  %5.1f%%\n", prof_names[i], prof_ms[i], total > 0 ? 100 * prof_ms[i] / total : 0);
+    for (int i = 0; i < P_N; i++) {
+        if (zc_prof_ms[i] > 0)
+            fprintf(stderr, "  %-16s %9.1f ms  %5.1f%%\n", prof_names[i], zc_prof_ms[i], 100 * zc_prof_ms[i] / total);
+    }
+#endif
+#ifdef ZENCODEC_VOCOS
+    vocos_free(model->vocos);
 #endif
     free_conv(&model->init_conv);
     free_conv(&model->final_conv);
@@ -598,18 +569,33 @@ void zencodec_free(zencodec_model * model) {
         free_conv(&model->blocks[i].conv2);
         free_conv(&model->blocks[i].shortcut);
     }
-    for (int i = 0; i < model->n_tensors; i++) {
-        free(model->tensors[i].data);
-        free(model->tensors[i].f);
-    }
+    zc_store_free(&model->store);
     free(model);
 }
 
 const char * zencodec_backend(void) { return zc_backend_name(); }
 
-int zencodec_sample_rate(const zencodec_model * model) { return model->sample_rate; }
+int zencodec_sample_rate(const zencodec_model * model) { return model->vocos ? 24000 : model->sample_rate; }
 int zencodec_hop_length (const zencodec_model * model) { (void) model; return RATIOS[0] * RATIOS[1] * RATIOS[2] * RATIOS[3]; }
-int zencodec_n_codebooks(const zencodec_model * model) { return model->n_codebooks; }
+const char * zencodec_decoder(const zencodec_model * model) { return model->vocos ? "vocos" : "encodec"; }
+int zencodec_lookahead(const zencodec_model * model) { return model->vocos ? VOCOS_LOOKAHEAD : 0; }
+
+int zencodec_n_codebooks(const zencodec_model * model) {
+#ifdef ZENCODEC_VOCOS
+    if (model->vocos) return vocos_n_codebooks(model->vocos);
+#endif
+    return model->n_codebooks;
+}
+
+// entries per codebook: codes must be below this
+static int n_bins(const zencodec_model * m) { return m->vocos ? 1024 : m->n_bins; }
+
+static bool valid_n_q(const zencodec_model * m, int n_q) {
+#ifdef ZENCODEC_VOCOS
+    if (m->vocos) return vocos_valid_n_q(m->vocos, n_q);
+#endif
+    return n_q >= 1 && n_q <= m->n_codebooks;
+}
 
 // ---------------------------------------------------------------------------
 // streaming decoder
@@ -617,21 +603,32 @@ int zencodec_n_codebooks(const zencodec_model * model) { return model->n_codeboo
 struct zencodec_stream {
     const zencodec_model * m;
     int       n_q;
-    zc_pool * pool; // n_threads - 1 workers, reused by every layer (NULL: single-threaded)
+    zc_pool * pool;  // n_threads - 1 workers, reused by every layer (NULL: single-threaded)
+    bool      ended; // flushed: takes no more codes
+    vocos_stream * vocos;
 
-    // state carried from one chunk to the next (see conv1d, conv_transpose1d)
+    // EnCodec state carried from one chunk to the next (see conv1d, conv_transpose1d)
     act     init_hist, block_hist[4], final_hist;
     act     block_tail[4];
     float * lstm_state; // h, c for each of the 2 layers, [4][512]
 };
 
 zencodec_stream * zencodec_stream_new(const zencodec_model * m, int n_q, int n_threads) {
-    if (n_q < 1 || n_q > m->n_codebooks) return NULL;
+    if (!valid_n_q(m, n_q)) return NULL;
     zencodec_stream * s = calloc(1, sizeof(*s));
     if (!s) return NULL;
     s->m = m;
     s->n_q = n_q;
     s->pool = zc_pool_new(n_threads);
+#ifdef ZENCODEC_VOCOS
+    if (m->vocos) {
+        if (!(s->vocos = vocos_stream_new(m->vocos, n_q))) {
+            zencodec_stream_free(s);
+            return NULL;
+        }
+        return s;
+    }
+#endif
     s->lstm_state = calloc((size_t) 4 * m->init_conv.C_out, sizeof(float));
     for (int i = 0; i < 4; i++) {
         const conv * up = &m->blocks[i].upsample;
@@ -642,6 +639,9 @@ zencodec_stream * zencodec_stream_new(const zencodec_model * m, int n_q, int n_t
 
 void zencodec_stream_free(zencodec_stream * s) {
     if (!s) return;
+#ifdef ZENCODEC_VOCOS
+    vocos_stream_free(s->vocos);
+#endif
     act_free(&s->init_hist);
     act_free(&s->final_hist);
     for (int i = 0; i < 4; i++) {
@@ -653,15 +653,10 @@ void zencodec_stream_free(zencodec_stream * s) {
     free(s);
 }
 
-int zencodec_stream_decode(zencodec_stream * s, const int32_t * codes, int n_frames, float * audio) {
+static int encodec_decode_chunk(zencodec_stream * s, const int32_t * codes, int n_frames, float * audio) {
     const zencodec_model * m = s->m;
     const int H = m->hidden_dim, T = n_frames;
     zc_pool * pool = s->pool;
-
-    if (T < 1) return 1;
-    for (size_t i = 0; i < (size_t) s->n_q * T; i++) {
-        if (codes[i] < 0 || codes[i] >= m->n_bins) return 2;
-    }
 
     // residual vector quantizer: sum the selected embeddings
     PROF_BEGIN();
@@ -725,24 +720,64 @@ int zencodec_stream_decode(zencodec_stream * s, const int32_t * codes, int n_fra
 
     memcpy(audio, tmp.d, (size_t) tmp.T * sizeof(float));
     act_free(&tmp);
+    return T * zencodec_hop_length(m);
+}
+
+int zencodec_stream_push(zencodec_stream * s, const int32_t * codes, int n_frames, float * audio) {
+    if (n_frames < 1 || s->ended) return -1;
+    for (size_t i = 0; i < (size_t) s->n_q * n_frames; i++) {
+        if (codes[i] < 0 || codes[i] >= n_bins(s->m)) return -2;
+    }
+#ifdef ZENCODEC_VOCOS
+    if (s->vocos) {
+        const int n = vocos_stream_push(s->vocos, codes, n_frames, false, audio, s->pool);
+        return n < 0 ? -3 : n;
+    }
+#endif
+    return encodec_decode_chunk(s, codes, n_frames, audio);
+}
+
+int zencodec_stream_flush(zencodec_stream * s, float * audio) {
+    if (s->ended) return 0;
+    s->ended = true;
+#ifdef ZENCODEC_VOCOS
+    if (s->vocos) {
+        const int n = vocos_stream_push(s->vocos, NULL, 0, true, audio, s->pool);
+        return n < 0 ? -3 : n;
+    }
+#endif
+    (void) audio;
     return 0;
+}
+
+int zencodec_stream_decode(zencodec_stream * s, const int32_t * codes, int n_frames, float * audio) {
+    if (zencodec_lookahead(s->m) > 0) return 4; // use zencodec_stream_push
+    const int n = zencodec_stream_push(s, codes, n_frames, audio);
+    return n == -1 ? 1 : n == -2 ? 2 : n < 0 ? 3 : 0;
 }
 
 int zencodec_decode(const zencodec_model * m, const int32_t * codes, int n_q, int n_frames,
                     float * audio, int n_threads) {
-    if (n_q < 1 || n_q > m->n_codebooks || n_frames < 1) return 1;
+    if (!valid_n_q(m, n_q) || n_frames < 1) return 1;
     for (size_t i = 0; i < (size_t) n_q * n_frames; i++) {
-        if (codes[i] < 0 || codes[i] >= m->n_bins) return 2;
+        if (codes[i] < 0 || codes[i] >= n_bins(m)) return 2;
     }
 
     zencodec_stream * s = zencodec_stream_new(m, n_q, n_threads);
     int32_t * chunk = malloc((size_t) n_q * ZENCODEC_CHUNK_FRAMES * sizeof(int32_t));
     int ret = s && chunk ? 0 : 3;
+    size_t done = 0; // samples written
     for (int f = 0; f < n_frames && ret == 0; f += ZENCODEC_CHUNK_FRAMES) {
         const int n = n_frames - f < ZENCODEC_CHUNK_FRAMES ? n_frames - f : ZENCODEC_CHUNK_FRAMES;
         for (int q = 0; q < n_q; q++)
             memcpy(chunk + (size_t) q * n, codes + (size_t) q * n_frames + f, (size_t) n * sizeof(int32_t));
-        ret = zencodec_stream_decode(s, chunk, n, audio + (size_t) f * zencodec_hop_length(m));
+        const int w = zencodec_stream_push(s, chunk, n, audio + done);
+        if (w < 0) ret = 3;
+        else       done += (size_t) w;
+    }
+    if (ret == 0) {
+        const int w = zencodec_stream_flush(s, audio + done);
+        if (w < 0) ret = 3;
     }
     free(chunk);
     zencodec_stream_free(s);
