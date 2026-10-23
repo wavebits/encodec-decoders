@@ -61,9 +61,18 @@ All the heavy layers are matrix products, which go through one small interface
 | `ref` | everywhere | plain C loops the compiler vectorizes | none |
 | `neon` | any AArch64: Apple silicon, Android phones, Raspberry Pi | hand-written NEON kernels (8×12 register blocking) | none |
 | `accelerate` | macOS, iOS | Apple's BLAS, which uses the CPU's matrix units | Accelerate (part of the OS) |
+| `blas` | Linux servers, anywhere with a CBLAS | OpenBLAS (or BLIS, MKL…), one single-threaded call per thread of the pool | `-lopenblas` |
 
 `-Dbackend=auto`, the default, picks `accelerate` on Apple platforms, `neon` on other
-AArch64 targets and `ref` elsewhere. The CLI prints the backend it was built with.
+AArch64 targets and `ref` elsewhere. `blas` is never picked automatically by
+`zig build`; use `-Dbackend=blas` (and `-Dblas-lib=` for a library other than OpenBLAS).
+OpenBLAS has tuned AVX2/AVX-512 kernels, while `ref` relies on the compiler, so on x86-64
+Linux `blas` is the backend to use. On an M1 (Vocos, 30 s, 1 thread) it took 0.61 s,
+against 0.67 s for `neon` and 1.83 s for `ref`, with the same output as `ref`. The C decoder keeps the thread count: it sets OpenBLAS,
+and OpenMP builds of it, to 1 thread on each thread that calls it, and splits the work
+itself. On Apple, Homebrew's OpenBLAS uses OpenMP, so build with
+`-DZENCODEC_BLAS_OMP -Wl,-U,_omp_set_num_threads` or set `OMP_NUM_THREADS=1`. The CLI
+prints the backend it was built with.
 
 ### f16 weights in memory
 
@@ -90,7 +99,7 @@ f32. Biases stay in f32, because they are tiny.
 - **Output is unchanged** with the f16 weights file, since those are the same values.
   With the f32 weights file, the weights are rounded to f16 on load, which gives the
   same result as the f16 file.
-- **Backends:** `ref` and `neon` only. Accelerate's BLAS takes f32 only, so with
+- **Backends:** `ref` and `neon` only. BLAS libraries take f32 only, so with
   `-Df16=true` the `auto` backend is `neon` on Apple silicon, and
   `-Dbackend=accelerate -Df16=true` is an error.
 - **Half-float conversion:** it uses the CPU's instruction where there is one: any
@@ -105,6 +114,7 @@ cc -std=c17 -O3 c/*.c -lm -lpthread -framework AudioToolbox -o wb_decode-c      
 cc -std=c17 -O3 -DZENCODEC_BACKEND_NEON c/*.c -lm -lpthread -o wb_decode-c                     # neon, Linux
 cc -std=c17 -O3 -DZENCODEC_BACKEND_ACCELERATE -DACCELERATE_NEW_LAPACK c/*.c -lm -lpthread \
    -framework AudioToolbox -framework Accelerate -o wb_decode-c                                 # accelerate, macOS
+cc -std=c17 -O3 -DZENCODEC_BACKEND_BLAS c/*.c -lopenblas -lm -lpthread -o wb_decode-c           # blas, Linux
 cc -std=c17 -O3 -DZENCODEC_BACKEND_NEON -DZENCODEC_F16_WEIGHTS c/*.c -lm -lpthread -o wb_decode-c  # neon + f16, Linux
 ```
 
@@ -120,9 +130,9 @@ Stripped sizes:
 ### Embedding on phones and devices
 
 To embed the decoder, add `c/zencodec.{h,c}`, `c/internal.h`, `c/pool.{h,c}`, `c/backend.h`,
-`c/backend_ref.c` (plus `c/vocos.c` and `-DZENCODEC_VOCOS` for Vocos) and the backend file you want (`backend_neon.c` or `backend_accelerate.c`) to your project, and
+`c/backend_ref.c` (plus `c/vocos.c` and `-DZENCODEC_VOCOS` for Vocos) and the backend file you want (`backend_neon.c`, `backend_accelerate.c` or `backend_blas.c`) to your project, and
 define its `ZENCODEC_BACKEND_*` macro. They need only libc, libm and pthreads (plus
-Accelerate for that backend). Leave out `c/play.c` and `c/main.c`, which are the CLI.
+Accelerate or a CBLAS for those backends). Leave out `c/play.c` and `c/main.c`, which are the CLI.
 
 - **iOS / macOS:** add the files to an Xcode target. They can be called from Swift through
   a bridging header.

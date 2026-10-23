@@ -108,7 +108,7 @@ void zc_mat_free(zc_mat * a) {
     a->packed = NULL;
 }
 
-#if !defined(ZENCODEC_BACKEND_NEON) && !defined(ZENCODEC_BACKEND_ACCELERATE)
+#if !defined(ZENCODEC_BACKEND_NEON) && !defined(ZENCODEC_BACKEND_ACCELERATE) && !defined(ZENCODEC_BACKEND_BLAS)
 
 bool zc_mat_prepare(zc_mat * a) { (void) a; return true; }
 

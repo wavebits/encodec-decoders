@@ -7,10 +7,11 @@
 //   (none)                       ref:        portable C, no dependencies
 //   -DZENCODEC_BACKEND_NEON      neon:       hand-written AArch64 NEON kernels
 //   -DZENCODEC_BACKEND_ACCELERATE accelerate: Apple's BLAS (link -framework Accelerate)
+//   -DZENCODEC_BACKEND_BLAS      blas:       any CBLAS, e.g. OpenBLAS (link -lopenblas)
 //
 // -DZENCODEC_F16_WEIGHTS keeps the weights in memory as IEEE half floats, which halves
 // their size (about 23 MB less). The kernels widen them to f32 as they load them, and
-// all arithmetic stays in f32. Supported by ref and neon; accelerate's BLAS takes f32 only.
+// all arithmetic stays in f32. Supported by ref and neon; BLAS libraries take f32 only.
 #ifndef ZENCODEC_BACKEND_H
 #define ZENCODEC_BACKEND_H
 
@@ -20,8 +21,8 @@
 #include <stdint.h>
 #include <string.h>
 
-#if defined(ZENCODEC_F16_WEIGHTS) && defined(ZENCODEC_BACKEND_ACCELERATE)
-#error "ZENCODEC_F16_WEIGHTS is not supported by the accelerate backend (its BLAS is f32 only)"
+#if defined(ZENCODEC_F16_WEIGHTS) && (defined(ZENCODEC_BACKEND_ACCELERATE) || defined(ZENCODEC_BACKEND_BLAS))
+#error "ZENCODEC_F16_WEIGHTS is not supported by the accelerate and blas backends (BLAS is f32 only)"
 #endif
 
 // IEEE half to float. With hardware conversion (any AArch64, or x86 built with F16C,
