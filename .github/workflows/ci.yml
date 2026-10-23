@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  ZIG_VERSION: 0.17.0
+
+jobs:
+  # Every backend and option compiles, on the platforms each one targets.
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, args: -Dbackend=ref }
+          - { os: ubuntu-latest, args: -Dbackend=ref -Df16=true }
+          - { os: ubuntu-latest, args: -Dbackend=blas }
+          - { os: ubuntu-latest, args: -Dtarget=aarch64-linux-musl }
+          - { os: ubuntu-latest, args: -Dtarget=x86_64-linux-musl }
+          - { os: ubuntu-24.04-arm, args: -Dbackend=neon }
+          - { os: ubuntu-24.04-arm, args: -Dbackend=neon -Df16=true }
+          - { os: macos-latest, args: -Dbackend=accelerate }
+          - { os: macos-latest, args: -Dbackend=neon -Df16=true }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - if: contains(matrix.args, 'blas')
+        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
+      - run: zig build -Dvocos=true ${{ matrix.args }}
+      - run: zig build -Dvocos=false ${{ matrix.args }}
+
+  # Output matches PyTorch EnCodec and PyTorch Vocos (tests/compare.py).
+  accuracy:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, backend: ref }
+          - { os: ubuntu-latest, backend: blas }
+          - { os: macos-latest, backend: accelerate }
+          - { os: macos-latest, backend: neon }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - if: matrix.backend == 'blas'
+        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
+      - name: Install PyTorch, EnCodec and Vocos
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu torch torchaudio
+          pip install numpy encodec vocos
+      - uses: actions/cache@v4
+        with:
+          path: |
+            weights
+            ~/.cache/torch
+            ~/.cache/huggingface
+          key: weights-${{ hashFiles('scripts/convert.py', 'scripts/convert_vocos.py') }}
+      - name: Convert weights
+        run: |
+          [ -f weights/encodec_24khz_decoder_f16.bin ] || python scripts/convert.py --use-f16
+          [ -f weights/vocos_encodec_24khz_f16.bin ] || python scripts/convert_vocos.py --use-f16
+      - run: zig build -Dvocos=true -Dbackend=${{ matrix.backend }}
+      - name: EnCodec (C)
+        run: python tests/compare.py zig-out/bin/wb_decode-c weights/encodec_24khz_decoder_f16.bin
+      - name: Vocos (C)
+        run: python tests/compare.py zig-out/bin/wb_decode-c weights/vocos_encodec_24khz_f16.bin --vocos
+      - name: EnCodec (Zig)
+        if: matrix.backend == 'ref'
+        run: python tests/compare.py zig-out/bin/wb_decode-zig weights/encodec_24khz_decoder_f16.bin

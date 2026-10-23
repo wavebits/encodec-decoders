@@ -1,0 +1,55 @@
+name: Release
+
+# Pushing a tag such as v0.7.0 builds the CLI for each platform and publishes a GitHub
+# release. The weights are not included (see the README's license section).
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  ZIG_VERSION: 0.17.0
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          # static, any x86-64 CPU (ref backend)
+          - { os: ubuntu-latest, name: linux-x86_64, args: -Dtarget=x86_64-linux-musl -Dcpu=baseline }
+          # static, x86-64 with AVX2 + FMA (ref backend)
+          - { os: ubuntu-latest, name: linux-x86_64-v3, args: -Dtarget=x86_64-linux-musl -Dcpu=x86_64_v3 }
+          # static, any AArch64 CPU (neon backend)
+          - { os: ubuntu-latest, name: linux-aarch64, args: -Dtarget=aarch64-linux-musl -Dcpu=baseline }
+          # Apple silicon (accelerate backend)
+          - { os: macos-latest, name: macos-arm64, args: -Dcpu=baseline }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - run: zig build -Dstrip=true -Dvocos=true ${{ matrix.args }}
+      - name: Package
+        run: |
+          dir=flmsbmp-${GITHUB_REF_NAME}-${{ matrix.name }}
+          mkdir "$dir"
+          cp zig-out/bin/wb_decode-c zig-out/bin/wb_decode-zig LICENSE README.md "$dir"/
+          tar czf "$dir.tar.gz" "$dir"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: flmsbmp-*.tar.gz
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - run: sha256sum flmsbmp-*.tar.gz > SHA256SUMS
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" flmsbmp-*.tar.gz SHA256SUMS --repo "$GITHUB_REPOSITORY" --generate-notes
