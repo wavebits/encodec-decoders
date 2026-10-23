@@ -592,6 +592,11 @@ the model is [EnCodec](https://github.com/facebookresearch/encodec) by Meta AI.
 
 The FLMSBMP code is released under the [MIT License](LICENSE).
 
+| Decoder | Weights | License |
+| --- | --- | --- |
+| EnCodec (default) | Meta's `encodec_24khz` | **CC-BY-NC 4.0**: non-commercial only |
+| Vocos (optional) | `charactr/vocos-encodec-24khz` | **MIT**, but it contains EnCodec's CC-BY-NC 4.0 codebooks |
+
 The EnCodec weights are released by Meta under
 [CC-BY-NC 4.0](https://github.com/facebookresearch/encodec#license). For that reason this
 repository does not include them. `scripts/convert.py` downloads them from Meta. Files

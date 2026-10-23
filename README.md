@@ -23,7 +23,10 @@ the same codes that is faster still.
 | 📦 Size to ship | **73 KB** | 90 KB | 1.0 MB | 518 MB + Python | 522 MB + Python |
 | 🎚️ Weights file | 23 MB | **20 MB** | 46.5 MB | 93 MB | 40 MB + EnCodec's 93 MB |
 | 🔌 Dependencies | libc (+ Accelerate on Apple) | same | ggml + C++ runtime | Python + PyTorch | Python + PyTorch + torchaudio |
+| 📜 Weights license | CC-BY-NC 4.0 (Meta) | MIT (Vocos) ¹ | CC-BY-NC 4.0 | CC-BY-NC 4.0 | MIT ¹ |
 | 🎯 Match to PyTorch (SNR) | 60.6 dB | 56.8 dB | 53.7 dB | reference | reference |
+
+¹ The Vocos checkpoint is MIT, but it embeds EnCodec's codebooks. See [License](#license).
 
 - **Fast:** 5× faster than PyTorch and 10× faster than encodec.cpp. With Vocos, 30 s of
   audio takes 0.30 s, which is 100× faster than real time and 7.6× faster than PyTorch
@@ -100,7 +103,12 @@ layer.
 
 ## License
 
-The code is MIT. The EnCodec weights are Meta's, under
-[CC-BY-NC 4.0](https://github.com/facebookresearch/encodec#license), so they are not in
-this repository: the scripts download them. The Vocos checkpoint is MIT, but it contains
-EnCodec's codebooks. See [MORE.md](MORE.md#credits--license).
+The code is MIT. The decoder you choose decides the license of the weights you ship:
+
+| Decoder | Weights | License |
+| --- | --- | --- |
+| EnCodec (default) | Meta's `encodec_24khz` | **[CC-BY-NC 4.0](https://github.com/facebookresearch/encodec#license)**: non-commercial only |
+| Vocos (optional) | `charactr/vocos-encodec-24khz` | **[MIT](https://huggingface.co/charactr/vocos-encodec-24khz)**, but it contains EnCodec's codebooks, which come from Meta's CC-BY-NC 4.0 weights |
+
+Neither weights file is in this repository: the scripts download them. Check both licenses
+before shipping commercially. See [MORE.md](MORE.md#credits--license).
