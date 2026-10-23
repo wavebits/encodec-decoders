@@ -9,6 +9,8 @@
 #ifndef ZENCODEC_H
 #define ZENCODEC_H
 
+#define ZENCODEC_VERSION "0.7.0"
+
 #include <stdint.h>
 
 #ifdef __cplusplus

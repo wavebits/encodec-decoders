@@ -211,6 +211,7 @@ static void decode_error(const zencodec_model * model, int n_q) {
 
 static int usage(const char * argv0) {
     fprintf(stderr,
+            "FLMSBMP " ZENCODEC_VERSION "\n"
             "usage: %s decode <weights.bin> <codes.bin|in.ecdc> <out.wav> [-t n_threads]\n"
             "       %s play   <weights.bin> <codes.bin|in.ecdc>           [-t n_threads]\n",
             argv0, argv0);
